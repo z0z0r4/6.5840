@@ -1,11 +1,16 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "os"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"strconv"
+	"time"
+)
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -23,44 +28,155 @@ func ihash(key string) int {
 
 var coordSockName string // socket for coordinator
 
-
 // main/mrworker.go calls this function.
 func Worker(sockname string, mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	coordSockName = sockname
 
-	// Your worker implementation here.
+	args := Params{}
+	for {
+		reply := Response{}
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+		// fmt.Printf("Worker %d: call args: %+v\n", os.Getpid(), args)
 
-}
+		ok := call("Coordinator.Manage", &args, &reply)
 
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
+		// fmt.Printf("Worker %d: call reply ok=%v, reply=%+v\n", os.Getpid(), ok, reply)
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+		if !ok {
+			log.Printf("%d: call failed", os.Getpid())
+			return
+		} else {
+			if reply.Done {
+				// fmt.Printf("Worker %d: all tasks done, exiting\n", os.Getpid())
+				return
+			}
 
-	// fill in the argument(s).
-	args.X = 99
+			// Run task
+			if reply.HasAssign {
+				if reply.TaskType == MapTask {
+					// Run map task
+					// Read file
+					content, err := os.ReadFile(reply.FileName)
+					if err != nil {
+						log.Fatalf("cannot read %v", reply.FileName)
+					}
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+					// Run map function
+					kva := mapf(reply.FileName, string(content))
 
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+					// Create intermediate json files
+					// intermediate files are named "mr-X-Y", where X is the map task number, and Y is the reduce task number.
+					intermediate_file_name_prefix := "mr-tmp-" + strconv.Itoa(os.Getpid()) + "-" + strconv.Itoa(reply.TaskID) + "-"
+					intermediateFiles := make([]*os.File, reply.NReduce)
+
+					for i := 0; i < reply.NReduce; i++ {
+						intermediate_file_name := intermediate_file_name_prefix + strconv.Itoa(i) + ".json"
+						intermediateFiles[i], err = os.Create(intermediate_file_name)
+						if err != nil {
+							log.Fatalf("cannot create %v", intermediate_file_name)
+						}
+					}
+
+					encoders := make([]*json.Encoder, reply.NReduce)
+					for i := 0; i < reply.NReduce; i++ {
+						encoders[i] = json.NewEncoder(intermediateFiles[i])
+					}
+
+					// Write intermediate files
+					for _, kv := range kva {
+						reduceTaskNumber := ihash(kv.Key) % reply.NReduce
+						enc := encoders[reduceTaskNumber]
+						err := enc.Encode(&kv)
+						if err != nil {
+							log.Fatalf("cannot write to %v", intermediateFiles[reduceTaskNumber].Name())
+						}
+					}
+
+					// Close intermediate files
+					for i := 0; i < reply.NReduce; i++ {
+						intermediateFiles[i].Close()
+					}
+
+					// Rename tmp files to final intermediate files
+					for i := 0; i < reply.NReduce; i++ {
+						intermediate_file_name := "mr-" + strconv.Itoa(reply.TaskID) + "-" + strconv.Itoa(i) + ".json"
+						err := os.Rename(intermediateFiles[i].Name(), intermediate_file_name)
+						if err != nil {
+							log.Fatalf("cannot rename %v to %v", intermediateFiles[i].Name(), intermediate_file_name)
+						}
+					}
+
+					args.Finished = true
+					args.TaskID = reply.TaskID
+					args.TaskType = reply.TaskType
+				} else if reply.TaskType == ReduceTask {
+					// Run reduce task
+					// Read intermediate files
+					intermediate := []KeyValue{}
+					for i := 0; i < reply.NMap; i++ {
+						intermediate_file_name := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(reply.TaskID) + ".json"
+						file, err := os.Open(intermediate_file_name)
+						if err != nil {
+							log.Fatalf("cannot open %v", intermediate_file_name)
+						}
+						dec := json.NewDecoder(file)
+						for {
+							var kv KeyValue
+							if err := dec.Decode(&kv); err != nil {
+								break
+							}
+							intermediate = append(intermediate, kv)
+						}
+						file.Close()
+					}
+
+					// Sort intermediate by key
+					sort.Slice(intermediate, func(i, j int) bool {
+						return intermediate[i].Key < intermediate[j].Key
+					})
+
+					// Generate k -> values and run reduce
+					output_kv := make(map[string]string)
+					i, j := 0, 0
+					for i < len(intermediate) {
+						j = i + 1
+						for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+							j++
+						}
+						values := []string{}
+						for k := i; k < j; k++ {
+							values = append(values, intermediate[k].Value)
+						}
+						output := reducef(intermediate[i].Key, values)
+						output_kv[intermediate[i].Key] = output
+						i = j
+					}
+
+					// Write output to file "mr-out-X", where X is the reduce task number.
+					output_file_name := "mr-out-" + strconv.Itoa(reply.TaskID)
+					output_file, err := os.Create(output_file_name)
+					if err != nil {
+						log.Fatalf("cannot create %v", output_file_name)
+					}
+					for k, v := range output_kv {
+						_, err := fmt.Fprintf(output_file, "%v %v\n", k, v)
+						if err != nil {
+							log.Fatalf("cannot write to %v", output_file_name)
+						}
+					}
+					output_file.Close()
+
+					args.Finished = true
+					args.TaskID = reply.TaskID
+					args.TaskType = reply.TaskType
+				}
+			} else {
+				time.Sleep(1 * time.Second)
+				args.Finished = false
+			}
+		}
 	}
 }
 

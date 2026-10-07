@@ -5,6 +5,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"net/rpc"
 	"os"
@@ -482,6 +483,9 @@ func (s *Server) proposeContext(ctx context.Context, op OP) (bool, int) {
 			break
 		}
 		retry_times++
+
+		// Avoid live lock
+		time.Sleep(time.Duration(rand.Intn(20)+10) * time.Millisecond)
 	}
 
 	return retry_times < retry_times_limit, seq

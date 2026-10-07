@@ -120,18 +120,18 @@ func (s *Server) Prepare(args *PrepareArgs, reply *PrepareReply) error {
 }
 
 type PrepareResult struct {
-	peer     string
-	prepared bool
-	reply    PrepareReply
+	peer  string
+	ok    bool
+	reply PrepareReply
 }
 
 func (s *Server) broadcastPrepare(seq int, proposalNumber int) (int, int, int, bool, OP) {
 	ch := make(chan PrepareResult, len(s.peers))
 
 	// the proposer is also an acceptor: run the local handler directly
-	var self PrepareReply
-	s.Prepare(&PrepareArgs{Seq: seq, ProposalNumber: proposalNumber}, &self)
-	ch <- PrepareResult{peer: s.peers[s.own_number], prepared: self.Prepared, reply: self}
+	var self_reply PrepareReply
+	err := s.Prepare(&PrepareArgs{Seq: seq, ProposalNumber: proposalNumber}, &self_reply)
+	ch <- PrepareResult{peer: s.peers[s.own_number], ok: err == nil, reply: self_reply}
 
 	for _, peer := range s.peers {
 		if peer == s.peers[s.own_number] {
@@ -139,8 +139,8 @@ func (s *Server) broadcastPrepare(seq int, proposalNumber int) (int, int, int, b
 		}
 		go func(peer string) {
 			var reply PrepareReply
-			ok := call(peer, "Server.Prepare", &PrepareArgs{Seq: seq, ProposalNumber: proposalNumber}, &reply)
-			ch <- PrepareResult{peer: peer, prepared: ok && reply.Prepared, reply: reply}
+			err := call(peer, "Server.Prepare", &PrepareArgs{Seq: seq, ProposalNumber: proposalNumber}, &reply)
+			ch <- PrepareResult{peer: peer, ok: err == nil, reply: reply}
 		}(peer)
 	}
 
@@ -156,22 +156,23 @@ func (s *Server) broadcastPrepare(seq int, proposalNumber int) (int, int, int, b
 	for responses < len(s.peers) {
 		result := <-ch
 		responses++
-		if result.prepared {
-			prepared_count++
-
-			// pick value
-			if result.reply.AcceptedProposalNumber > highest_accepted_proposal_number {
-				highest_accepted_proposal_number = result.reply.AcceptedProposalNumber
-				chosen_op = result.reply.Value
-				has_chosen_op = true
-			}
-		} else {
+		if result.ok {
 			if result.reply.Prepared {
-				network_error_count++
+				prepared_count++
+
+				// pick value
+				if result.reply.AcceptedProposalNumber > highest_accepted_proposal_number {
+					highest_accepted_proposal_number = result.reply.AcceptedProposalNumber
+					chosen_op = result.reply.Value
+					has_chosen_op = true
+				}
 			} else {
 				reject_count++
 			}
+		} else {
+			network_error_count++
 		}
+
 		if prepared_count >= s.majority || prepared_count+(len(s.peers)-responses) < s.majority {
 			break
 		}
@@ -239,11 +240,14 @@ func (s *Server) broadcastAccept(seq int, proposalNumber int, value OP) (int, in
 		}
 		go func(peer string) {
 			var reply AcceptReply
-			ok := call(peer, "Server.Accept", &AcceptArgs{Seq: seq, ProposalNumber: proposalNumber, Value: value}, &reply)
-			if ok {
+			err := call(peer, "Server.Accept", &AcceptArgs{Seq: seq, ProposalNumber: proposalNumber, Value: value}, &reply)
+			if err == nil {
 				ch <- AcceptResult{peer: peer, ok: true, accepted: reply.Accepted}
 			} else {
 				ch <- AcceptResult{peer: peer, ok: false, accepted: false}
+
+				// show error
+				fmt.Println("Server", s.own_number, "failed to call Accept on peer", peer, "for seq", seq, "proposal number", proposalNumber, "error:", err)
 			}
 		}(peer)
 	}
@@ -325,8 +329,8 @@ func (s *Server) broadcastDecide(seq int, instance PaxosInstance) int {
 		}
 		go func(peer string) {
 			var reply DecideReply
-			ok := call(peer, "Server.Decide", &DecideArgs{Seq: seq, Instance: instance}, &reply)
-			ch <- ok && reply.Result
+			err := call(peer, "Server.Decide", &DecideArgs{Seq: seq, Instance: instance}, &reply)
+			ch <- err == nil && reply.Result
 		}(peer)
 	}
 
@@ -338,6 +342,7 @@ func (s *Server) broadcastDecide(seq int, instance PaxosInstance) int {
 		if result {
 			success_count++
 		}
+
 		if success_count >= s.majority || success_count+(len(s.peers)-responses) < s.majority {
 			break
 		}

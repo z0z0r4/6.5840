@@ -67,21 +67,21 @@ type DecideReply struct {
 	Result bool
 }
 
-func call(peer, method string, args any, reply any) bool {
+func call(peer, method string, args any, reply any) error {
 	return callWithTimeout(peer, method, args, reply, rpcTimeout)
 }
 
-func callWithTimeout(peer, method string, args any, reply any, timeout time.Duration) bool {
+func callWithTimeout(peer, method string, args any, reply any, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	conn, err := (&net.Dialer{Deadline: deadline}).Dial("tcp", peer)
 	if err != nil {
-		return false
+		return err
 	}
 	if err := conn.SetDeadline(deadline); err != nil {
 		conn.Close()
-		return false
+		return err
 	}
 	client := rpc.NewClient(conn)
 	defer client.Close()
-	return client.Call(method, args, reply) == nil
+	return client.Call(method, args, reply)
 }

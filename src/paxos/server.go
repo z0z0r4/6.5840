@@ -5,7 +5,6 @@ import (
 	"encoding/gob"
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"net/rpc"
 	"os"
@@ -13,55 +12,44 @@ import (
 	"time"
 )
 
-type PaxosInstance struct {
-	NP        int
-	NA        int
-	Op        OP
-	Decided   bool
-	ReadValue string
+type Instance struct {
+	ProposalAcceptNumber int
+	Op                   OP
+	Decided              bool
+	ReadValue            string
 }
 
 type Server struct {
 	own_number int
 	peers      []string
 	majority   int
+	statePath  string
 
-	insts map[int]PaxosInstance
-	kv    map[string]string
+	insts       map[int]Instance
+	kv          map[string]string
+	requests    map[string]RequestRecord
+	checkpoint  Checkpoint
+	pinnedReads map[int]bool
+
+	phase                  leaderPhase
+	catchingUp             bool
+	proposalSlot           chan struct{}
+	leader                 int
+	leaderProposalNumber   int
+	promisedProposalNumber int
+	heartbeatTicker        *time.Ticker
+	lastHeartbeatTime      time.Time
 
 	max_seq   int
 	applied   int
 	round_num int
-	statePath string
 
-	mu   sync.Mutex
-	cond sync.Cond
-}
-
-func requestContext(deadlineUnixNano int64) (context.Context, context.CancelFunc) {
-	if deadlineUnixNano == 0 {
-		return context.Background(), func() {}
-	}
-	return context.WithDeadline(context.Background(), time.Unix(0, deadlineUnixNano))
-}
-
-// noteSeq records the largest instance number this server has heard about.
-// The caller must hold s.mu.
-func (s *Server) noteSeq(seq int) {
-	if seq > s.max_seq {
-		s.max_seq = seq
-	}
-}
-
-// The caller must hold s.mu.
-func (s *Server) makeProposalNumberLocked() int {
-	round := s.round_num
-	s.round_num++
-	return round*len(s.peers) + s.own_number
+	mu sync.Mutex
 }
 
 // Try to applyLocked all decided OP in order from applied+1 until the first undecided OP
 func (s *Server) applyLocked() {
+	defer s.compactLocked()
 	for {
 		next_seq_apply := s.applied + 1
 
@@ -70,6 +58,13 @@ func (s *Server) applyLocked() {
 			break
 		}
 
+		if inst.Op.ReqID != "" {
+			if _, exists := s.requests[inst.Op.ReqID]; exists {
+				s.applied++
+				continue
+			}
+			s.requests[inst.Op.ReqID] = RequestRecord{Op: inst.Op, Seq: next_seq_apply}
+		}
 		switch inst.Op.Action {
 		case "set":
 			s.kv[inst.Op.Key] = inst.Op.Value
@@ -83,465 +78,196 @@ func (s *Server) applyLocked() {
 		}
 
 		s.applied++
-		s.cond.Broadcast()
-
-		fmt.Println("Server", s.own_number, "applied op", inst.Op, "seq:", next_seq_apply)
 	}
 }
 
-func (s *Server) Prepare(args *PrepareArgs, reply *PrepareReply) error {
+func (s *Server) propose(ctx context.Context, op OP) proposalResult {
+	// Both proposals and elections own this slot. Queueing remains cancellable.
+	select {
+	case s.proposalSlot <- struct{}{}:
+	case <-ctx.Done():
+		return proposalResult{status: proposalExpired}
+	}
+	defer func() { <-s.proposalSlot }()
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.noteSeq(args.Seq)
-
-	reply.Seq = args.Seq
-
-	if _, exists := s.insts[args.Seq]; !exists {
-		// create a new instance for the given instance number
-		s.insts[args.Seq] = PaxosInstance{NP: -1, NA: -1, Op: OP{}}
+	if ctx.Err() != nil {
+		s.mu.Unlock()
+		return proposalResult{status: proposalExpired}
+	}
+	if !s.readyLocked() {
+		result := proposalResult{status: proposalRedirect, leader: s.leader}
+		s.mu.Unlock()
+		return result
 	}
 
-	if args.ProposalNumber > s.insts[args.Seq].NP {
-		// set np
-		inst := s.insts[args.Seq]
-		inst.NP = args.ProposalNumber
-		s.insts[args.Seq] = inst
-		if err := s.persistLocked(); err != nil {
-			log.Fatalf("persist Prepare: %v", err)
-		}
-
-		reply.Prepared = true
-		reply.AcceptedProposalNumber = s.insts[args.Seq].NA
-		reply.Value = s.insts[args.Seq].Op
-	}
-
-	fmt.Println("Server", s.own_number, "received Prepare for seq", args.Seq, "proposal number", args.ProposalNumber, "prepared:", reply.Prepared)
-
-	return nil
-}
-
-type PrepareResult struct {
-	peer  string
-	ok    bool
-	reply PrepareReply
-}
-
-func (s *Server) broadcastPrepare(seq int, proposalNumber int) (int, int, int, bool, OP) {
-	ch := make(chan PrepareResult, len(s.peers))
-
-	// the proposer is also an acceptor: run the local handler directly
-	var self_reply PrepareReply
-	err := s.Prepare(&PrepareArgs{Seq: seq, ProposalNumber: proposalNumber}, &self_reply)
-	ch <- PrepareResult{peer: s.peers[s.own_number], ok: err == nil, reply: self_reply}
-
-	for _, peer := range s.peers {
-		if peer == s.peers[s.own_number] {
-			continue
-		}
-		go func(peer string) {
-			var reply PrepareReply
-			err := call(peer, "Server.Prepare", &PrepareArgs{Seq: seq, ProposalNumber: proposalNumber}, &reply)
-			ch <- PrepareResult{peer: peer, ok: err == nil, reply: reply}
-		}(peer)
-	}
-
-	prepared_count := 0
-	network_error_count := 0
-	reject_count := 0
-	responses := 0
-
-	highest_accepted_proposal_number := -1
-	var chosen_op OP = OP{}
-	has_chosen_op := false
-
-	for responses < len(s.peers) {
-		result := <-ch
-		responses++
-		if result.ok {
-			if result.reply.Prepared {
-				prepared_count++
-
-				// pick value
-				if result.reply.AcceptedProposalNumber > highest_accepted_proposal_number {
-					highest_accepted_proposal_number = result.reply.AcceptedProposalNumber
-					chosen_op = result.reply.Value
-					has_chosen_op = true
-				}
-			} else {
-				reject_count++
-			}
-		} else {
-			network_error_count++
-		}
-
-		if prepared_count >= s.majority || prepared_count+(len(s.peers)-responses) < s.majority {
-			break
-		}
-	}
-
-	return prepared_count, network_error_count, reject_count, has_chosen_op, chosen_op
-}
-
-func (s *Server) Accept(args *AcceptArgs, reply *AcceptReply) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.noteSeq(args.Seq)
-
-	reply.Seq = args.Seq
-
-	if _, exists := s.insts[args.Seq]; !exists {
-		// create a new instance for the given instance number
-		s.insts[args.Seq] = PaxosInstance{NP: -1, NA: -1, Op: OP{}}
-	}
-
-	inst := s.insts[args.Seq]
-
-	if inst.Decided && inst.Op != args.Value {
-		return nil
-	}
-	if args.ProposalNumber >= inst.NP {
-		inst.NP = args.ProposalNumber
-		inst.NA = args.ProposalNumber
-		inst.Op = args.Value
-		s.insts[args.Seq] = inst
-		if err := s.persistLocked(); err != nil {
-			log.Fatalf("persist Accept: %v", err)
-		}
-
-		reply.Accepted = true
-	} else {
-		reply.Accepted = false
-	}
-
-	fmt.Println("Server", s.own_number, "received Accept for seq", args.Seq, "proposal number", args.ProposalNumber, "accepted:", reply.Accepted)
-
-	return nil
-}
-
-type AcceptResult struct {
-	peer     string
-	ok       bool
-	accepted bool
-}
-
-func (s *Server) broadcastAccept(seq int, proposalNumber int, value OP) (int, int, int) {
-	ch := make(chan AcceptResult, len(s.peers))
-
-	var self_reply AcceptReply
-	err := s.Accept(&AcceptArgs{Seq: seq, ProposalNumber: proposalNumber, Value: value}, &self_reply)
-	if err == nil {
-		ch <- AcceptResult{peer: s.peers[s.own_number], ok: true, accepted: self_reply.Accepted}
-	} else {
-		ch <- AcceptResult{peer: s.peers[s.own_number], ok: false, accepted: false}
-	}
-
-	for _, peer := range s.peers {
-		if peer == s.peers[s.own_number] {
-			continue
-		}
-		go func(peer string) {
-			var reply AcceptReply
-			err := call(peer, "Server.Accept", &AcceptArgs{Seq: seq, ProposalNumber: proposalNumber, Value: value}, &reply)
-			if err == nil {
-				ch <- AcceptResult{peer: peer, ok: true, accepted: reply.Accepted}
-			} else {
-				ch <- AcceptResult{peer: peer, ok: false, accepted: false}
-
-				// show error
-				fmt.Println("Server", s.own_number, "failed to call Accept on peer", peer, "for seq", seq, "proposal number", proposalNumber, "error:", err)
-			}
-		}(peer)
-	}
-
-	accepted_count := 0
-	network_error_count := 0
-	reject_count := 0
-	responses := 0
-	for responses < len(s.peers) {
-		result := <-ch
-		responses++
-		if result.ok {
-			if result.accepted {
-				accepted_count++
-			} else {
-				reject_count++
-			}
-		} else {
-			network_error_count++
-		}
-		if accepted_count >= s.majority || accepted_count+(len(s.peers)-responses) < s.majority {
-			break
-		}
-	}
-
-	return accepted_count, network_error_count, reject_count
-}
-
-func (s *Server) Decide(args *DecideArgs, reply *DecideReply) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	seq := args.Seq
-	s.noteSeq(seq)
-
-	if inst, exists := s.insts[seq]; exists && inst.Decided {
-		if inst.Op != args.Instance.Op {
-			return fmt.Errorf("instance %d already decided a different operation", seq)
-		}
-		reply.Result = true
-		return nil
-	}
-
-	np := args.Instance.NP
-	if current, exists := s.insts[seq]; exists && current.NP > np {
-		np = current.NP
-	}
-	s.insts[seq] = PaxosInstance{
-		NP:      np,
-		NA:      args.Instance.NA,
-		Op:      args.Instance.Op,
-		Decided: true,
-	}
-
-	fmt.Println("Server", s.own_number, "decided op", args.Instance.Op, "seq:", seq)
-
-	s.applyLocked()
-	if err := s.persistLocked(); err != nil {
-		log.Fatalf("persist Decide: %v", err)
-	}
-	reply.Result = true
-	return nil
-}
-
-func (s *Server) broadcastDecide(seq int, instance PaxosInstance) int {
-	ch := make(chan bool, len(s.peers))
-
-	var self_reply DecideReply
-	err := s.Decide(&DecideArgs{Seq: seq, Instance: instance}, &self_reply)
-	if err == nil {
-		ch <- true
-	} else {
-		ch <- false
-	}
-
-	for _, peer := range s.peers {
-		if peer == s.peers[s.own_number] {
-			continue
-		}
-		go func(peer string) {
-			var reply DecideReply
-			err := call(peer, "Server.Decide", &DecideArgs{Seq: seq, Instance: instance}, &reply)
-			ch <- err == nil && reply.Result
-		}(peer)
-	}
-
-	success_count := 0
-	responses := 0
-	for responses < len(s.peers) {
-		result := <-ch
-		responses++
-		if result {
-			success_count++
-		}
-
-		if success_count >= s.majority || success_count+(len(s.peers)-responses) < s.majority {
-			break
-		}
-	}
-
-	return success_count
-}
-
-// Decide one log slot, adopting any previously accepted value.
-func (s *Server) proposeAt(seq int, op OP) OP {
-	chosen, _ := s.proposeAtContext(context.Background(), seq, op)
-	return chosen
-}
-
-func (s *Server) proposeAtContext(ctx context.Context, seq int, op OP) (OP, bool) {
-	for {
-		if err := ctx.Err(); err != nil {
-			return OP{}, false
-		}
-		s.mu.Lock()
-		if inst, exists := s.insts[seq]; exists && inst.Decided {
-			s.mu.Unlock()
-			return inst.Op, true
+	// 检查重复请求
+	if old, exists := s.requests[op.ReqID]; op.ReqID != "" && exists {
+		status := proposalApplied
+		if old.Op != op {
+			status = proposalConflict
 		}
 		s.mu.Unlock()
-
-		// stage 1: prepare
-		s.mu.Lock()
-		n := s.makeProposalNumberLocked()
-		if err := s.persistLocked(); err != nil {
-			log.Fatalf("persist proposal number: %v", err)
-		}
-		s.mu.Unlock()
-		prepared_count, _, _, has_chosen_op, chosen_op := s.broadcastPrepare(seq, n)
-		if err := ctx.Err(); err != nil {
-			return OP{}, false
-		}
-
-		if prepared_count < s.majority {
-			continue
-		}
-		if !has_chosen_op {
-			chosen_op = op
-		}
-
-		// stage 2: accept
-		accepted_count, _, _ := s.broadcastAccept(seq, n, chosen_op)
-		if err := ctx.Err(); err != nil {
-			return OP{}, false
-		}
-
-		if accepted_count >= s.majority {
-			inst := PaxosInstance{NP: n, NA: n, Op: chosen_op, Decided: true}
-			s.broadcastDecide(seq, inst)
-			return chosen_op, true
-		}
+		return proposalResult{status: status}
 	}
-}
 
-// Fill in any missing decided instances up to the given sequence number by proposing nop
-func (s *Server) waitAppliedContext(ctx context.Context, seq int) bool {
-	for {
-		if err := ctx.Err(); err != nil {
-			return false
-		}
+	proposalNumber, seq := s.leaderProposalNumber, s.max_seq+1
+
+	if op.Action == "get" {
+		s.pinnedReads[seq] = true
+	}
+	s.mu.Unlock()
+
+	completed := false
+
+	defer func() {
 		s.mu.Lock()
-		if s.applied >= seq {
-			s.mu.Unlock()
-			return true
+		defer s.mu.Unlock()
+
+		if op.Action == "get" {
+			delete(s.pinnedReads, seq)
+			// Release a result retained through a concurrent compaction.
+			if seq <= s.checkpoint.Seq {
+				delete(s.insts, seq)
+			}
 		}
 
-		timedOut := false
-		timer := time.AfterFunc(100*time.Millisecond, func() {
+		// An incomplete Accept may have left a hole. Recover before new slots.
+		if !completed {
+			s.invalidateLeaderLocked(proposalNumber, false)
+		}
+	}()
+
+	for ctx.Err() == nil {
+		s.mu.Lock()
+		// 释放锁后重新检查
+		active := s.readyLocked() && s.inLeaderProposalNumberLocked(proposalNumber)
+		leader := s.leader
+		s.mu.Unlock()
+
+		if !active {
+			return proposalResult{status: proposalRedirect, leader: leader}
+		}
+
+		if s.broadcastAcceptContext(ctx, seq, proposalNumber, op) >= s.majority {
+			s.announceDecision(seq, Instance{ProposalAcceptNumber: proposalNumber, Op: op, Decided: true})
+
 			s.mu.Lock()
-			timedOut = true
-			s.cond.Broadcast()
+			result := s.proposedResultLocked(seq, op)
 			s.mu.Unlock()
-		})
-		for s.applied < seq && !timedOut {
-			if err := ctx.Err(); err != nil {
-				break
-			}
-			s.cond.Wait()
-		}
-		timer.Stop()
-		if s.applied >= seq {
-			s.mu.Unlock()
-			return true
-		}
-		if err := ctx.Err(); err != nil {
-			s.mu.Unlock()
-			return false
+
+			completed = result.status == proposalApplied
+			return result
 		}
 
-		missing_seq := s.applied + 1
-		inst, exists := s.insts[missing_seq]
-		s.mu.Unlock()
-
-		if !exists || !inst.Decided {
-			if _, ok := s.proposeAtContext(ctx, missing_seq, OP{Action: "nop"}); !ok {
-				return false
-			}
+		// 等待 30ms 后重试，或者直到上下文过期
+		select {
+		case <-ctx.Done():
+			return proposalResult{status: proposalExpired}
+		case <-time.After(retryInterval):
 		}
 	}
+	return proposalResult{status: proposalExpired}
 }
 
-// Try to propose a given value, return whether the proposal was successful and the sequence number
-func (s *Server) propose(op OP) (bool, int) {
-	return s.proposeContext(context.Background(), op)
-}
+// Recheck heartbeat expiration after acquiring the proposal slot.
+func (s *Server) electLeader() {
+	s.proposalSlot <- struct{}{}
+	defer func() { <-s.proposalSlot }()
 
-func (s *Server) proposeContext(ctx context.Context, op OP) (bool, int) {
-	retry_times_limit := 5
-	retry_times := 0
-
-	seq := 0
-
-	for retry_times < retry_times_limit {
-		if err := ctx.Err(); err != nil {
-			return false, seq
-		}
+	s.mu.Lock()
+	if s.readyLocked() || time.Since(s.lastHeartbeatTime) < heartbeatTimeout {
+		s.mu.Unlock()
+		return
+	}
+	s.catchupRoundNumLocked(s.promisedProposalNumber)
+	n := s.makeProposalNumberLocked()
+	// Failed Prepare/recovery must not keep receiving leader heartbeats forever.
+	defer func() {
 		s.mu.Lock()
-		// seq move forward only here
-		// if the proposal failed (not decided and applied), we will find a empty slot
-		seq = s.max_seq + 1
+		defer s.mu.Unlock()
+		if !s.readyLocked() {
+			s.invalidateLeaderLocked(n, true)
+		}
+	}()
+	applied := s.applied
+	s.mustPersistLocked("round")
+	s.mu.Unlock()
+
+	// Prepare phase
+	count, values, highest, checkpoint := s.broadcastPrepare(n, applied)
+	if count < s.majority {
+		s.mu.Lock()
+		s.catchupRoundNumLocked(highest)
 		s.mu.Unlock()
-
-		chosen_op, ok := s.proposeAtContext(ctx, seq, op)
-		if !ok {
-			return false, seq
-		}
-
-		if chosen_op == op {
-			if !s.waitAppliedContext(ctx, seq) {
-				return false, seq
-			}
-			break
-		}
-		retry_times++
-
-		// Avoid live lock
-		time.Sleep(time.Duration(rand.Intn(20)+10) * time.Millisecond)
+		return
 	}
 
-	return retry_times < retry_times_limit, seq
+	// Recover phase
+	s.mu.Lock()
+	if !s.inLeaderProposalNumberLocked(n) {
+		s.mu.Unlock()
+		return
+	}
+	s.phase = leaderRecovering
+	s.installCheckpointLocked(checkpoint)
+	s.mustPersistLocked("election checkpoint")
+	applied = s.applied
+	end := s.max_seq
+	s.mu.Unlock()
+
+	for seq := range values {
+		if seq > end {
+			end = seq
+		}
+	}
+	// Recover only the suffix after this candidate's applied prefix.
+	for seq := applied + 1; seq <= end; seq++ {
+		s.mu.Lock()
+		if s.recoveryInterruptedLocked(n) {
+			s.mu.Unlock()
+			return
+		}
+		s.mu.Unlock()
+
+		op := OP{Action: "nop"}
+		if old, exists := values[seq]; exists {
+			op = old.Value
+		}
+		accepted := s.broadcastAccept(seq, n, op)
+		if accepted < s.majority {
+			return
+		}
+		s.broadcastDecide(seq, Instance{ProposalAcceptNumber: n, Op: op, Decided: true})
+	}
+
+	s.mu.Lock()
+	if s.inLeaderProposalNumberLocked(n) {
+		s.phase = leaderReady
+		s.lastHeartbeatTime = time.Now()
+	}
+	s.mu.Unlock()
 }
 
 func (s *Server) Set(args *ClientSetRequest, reply *ClientSetReply) error {
+	if args.ReqID == "" {
+		return fmt.Errorf("write requires ReqID")
+	}
 	ctx, cancel := requestContext(args.DeadlineUnixNano)
 	defer cancel()
-	ok, seq := s.proposeContext(ctx, OP{Action: "set", Key: args.Key, Value: args.Value})
-
-	if !ok {
-		reply.Result = false
-		return nil
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	inst, exists := s.insts[seq]
-
-	if !exists {
-		reply.Result = false
-		return nil
-	}
-
-	reply.Result = inst.Decided && s.applied >= seq
-
+	result := s.propose(ctx, OP{ReqID: args.ReqID, Action: "set", Key: args.Key, Value: args.Value})
+	reply.Result = result.status == proposalApplied
+	reply.LeaderAddress = s.redirectAddress(result)
 	return nil
 }
 
 func (s *Server) Get(args *ClientGetRequest, reply *ClientGetResponse) error {
 	ctx, cancel := requestContext(args.DeadlineUnixNano)
 	defer cancel()
-	ok, seq := s.proposeContext(ctx, OP{Action: "get", Key: args.Key})
-
-	if !ok {
-		reply.Result = false
-		return nil
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	inst, exists := s.insts[seq]
-
-	if !exists {
-		reply.Result = false
-		return nil
-	}
-
-	reply.Result = inst.Decided && s.applied >= seq
-
-	if reply.Result {
-		reply.Value = inst.ReadValue
-	}
-
+	result := s.propose(ctx, OP{Action: "get", Key: args.Key})
+	reply.Result = result.status == proposalApplied
+	reply.Value = result.value
+	reply.LeaderAddress = s.redirectAddress(result)
 	return nil
 }
 
@@ -564,6 +290,13 @@ func Serve(me int, peers []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// Start the heartbeat ticker
+	s.StartHeartbeat()
+
+	// Start the health check ticker
+	s.StartHealthCheck()
+
 	for {
 		conn, err := l.Accept()
 		if err != nil {

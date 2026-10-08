@@ -6,18 +6,22 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"time"
 )
 
-const snapshotVersion = 1
+const snapshotVersion = 3
 
 type serverSnapshot struct {
-	Version  int
-	Peers    []string
-	Insts    map[int]PaxosInstance
-	KV       map[string]string
-	MaxSeq   int
-	Applied  int
-	RoundNum int
+	Checkpoint             Checkpoint
+	Version                int
+	Peers                  []string
+	Insts                  map[int]Instance
+	KV                     map[string]string
+	Requests               map[string]RequestRecord
+	MaxSeq                 int
+	Applied                int
+	RoundNum               int
+	PromisedProposalNumber int
 }
 
 // load restores a snapshot before the server begins accepting RPCs.
@@ -38,15 +42,18 @@ func (s *Server) load() error {
 	if snapshot.Version != snapshotVersion || !slices.Equal(snapshot.Peers, s.peers) {
 		return fmt.Errorf("snapshot %s does not match this cluster", s.statePath)
 	}
-	if snapshot.Insts == nil || snapshot.KV == nil || snapshot.Applied > snapshot.MaxSeq {
+	if snapshot.Insts == nil || snapshot.KV == nil || snapshot.Requests == nil || snapshot.Applied > snapshot.MaxSeq || snapshot.Checkpoint.Seq < 0 || snapshot.Checkpoint.Seq > snapshot.Applied || snapshot.Checkpoint.KV == nil || snapshot.Checkpoint.Requests == nil {
 		return fmt.Errorf("snapshot %s has invalid state", s.statePath)
 	}
 
+	s.checkpoint = snapshot.Checkpoint
 	s.insts = snapshot.Insts
 	s.kv = snapshot.KV
+	s.requests = snapshot.Requests
 	s.max_seq = snapshot.MaxSeq
 	s.applied = snapshot.Applied
 	s.round_num = snapshot.RoundNum
+	s.promisedProposalNumber = snapshot.PromisedProposalNumber
 	return nil
 }
 
@@ -67,8 +74,8 @@ func (s *Server) persistLocked() error {
 	defer os.Remove(file.Name())
 
 	snapshot := serverSnapshot{
-		Version: snapshotVersion, Peers: s.peers, Insts: s.insts, KV: s.kv,
-		MaxSeq: s.max_seq, Applied: s.applied, RoundNum: s.round_num,
+		Checkpoint: s.checkpoint, Version: snapshotVersion, Peers: s.peers, Insts: s.insts, KV: s.kv, Requests: s.requests,
+		MaxSeq: s.max_seq, Applied: s.applied, RoundNum: s.round_num, PromisedProposalNumber: s.promisedProposalNumber,
 	}
 	if err := gob.NewEncoder(file).Encode(snapshot); err != nil {
 		file.Close()
@@ -97,14 +104,21 @@ func newServer(me int, peers []string, dataDir string) (*Server, error) {
 		return nil, fmt.Errorf("peer index %d out of range", me)
 	}
 	s := &Server{
-		own_number: me,
-		peers:      peers,
-		majority:   len(peers)/2 + 1,
-		insts:      make(map[int]PaxosInstance),
-		kv:         make(map[string]string),
-		statePath:  filepath.Join(dataDir, fmt.Sprintf("peer-%d.gob", me)),
+		own_number:             me,
+		proposalSlot:           make(chan struct{}, 1),
+		leader:                 -1,
+		leaderProposalNumber:   -1,
+		promisedProposalNumber: -1,
+		lastHeartbeatTime:      time.Now(),
+		peers:                  peers,
+		majority:               len(peers)/2 + 1,
+		insts:                  make(map[int]Instance),
+		kv:                     make(map[string]string),
+		requests:               make(map[string]RequestRecord),
+		pinnedReads:            make(map[int]bool),
+		checkpoint:             Checkpoint{KV: make(map[string]string), Requests: make(map[string]RequestRecord)},
+		statePath:              filepath.Join(dataDir, fmt.Sprintf("peer-%d.gob", me)),
 	}
-	s.cond.L = &s.mu
 	if err := s.load(); err != nil {
 		return nil, err
 	}

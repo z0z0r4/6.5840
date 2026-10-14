@@ -119,3 +119,83 @@ func TestNewNestedDirectoryAndTornMagic(t *testing.T) {
 		}
 	}
 }
+
+func TestEveryCompleteWALByteHasIntegrityProtection(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "good.wal")
+	if _, err := Append(source, []byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	good, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range good {
+		for bit := uint(0); bit < 8; bit++ {
+			damaged := bytes.Clone(good)
+			damaged[i] ^= 1 << bit
+			path := filepath.Join(t.TempDir(), "bad.wal")
+			if err := os.WriteFile(path, damaged, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := records(t, path); err == nil {
+				t.Fatalf("byte %d bit %d corrupted WAL accepted", i, bit)
+			}
+			after, _ := os.ReadFile(path)
+			if !bytes.Equal(after, damaged) {
+				t.Fatal("checksum failure changed journal")
+			}
+		}
+	}
+}
+func TestLegacyWALHeaderUpgradePreservesRecordsAndRepair(t *testing.T) {
+	for _, mode := range []string{"complete", "torn", "corrupt"} {
+		t.Run(mode, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "node.wal")
+			Append(path, []byte("durable"))
+			prefix, _ := os.ReadFile(path)
+			Append(path, []byte("next"))
+			good, _ := os.ReadFile(path)
+			legacy := append(bytes.Clone(legacyMagic), good[FileHeaderBytes:]...)
+			if mode == "torn" {
+				legacy = legacy[:len(legacy)-1]
+			}
+			if mode == "corrupt" {
+				legacy[len(legacy)-1] ^= 1
+			}
+			if err := os.WriteFile(path, legacy, 0600); err != nil {
+				t.Fatal(err)
+			}
+			got, err := records(t, path)
+			if mode == "corrupt" {
+				if err == nil {
+					t.Fatal("corrupt legacy WAL accepted")
+				}
+				after, _ := os.ReadFile(path)
+				if !bytes.Equal(after, legacy) {
+					t.Fatal("corrupt legacy WAL rewritten")
+				}
+				return
+			}
+			want := []string{"durable", "next"}
+			expected := good
+			if mode == "torn" {
+				want = []string{"durable"}
+				expected = prefix
+			}
+			if err != nil || !reflect.DeepEqual(got, want) {
+				t.Fatalf("legacy replay: %v %v", got, err)
+			}
+			after, _ := os.ReadFile(path)
+			if !bytes.Equal(after, expected) {
+				t.Fatal("legacy header upgrade changed valid frames")
+			}
+			if _, err := Append(path, []byte("after")); err != nil {
+				t.Fatal(err)
+			}
+			got, err = records(t, path)
+			if err != nil || !reflect.DeepEqual(got, append(want, "after")) {
+				t.Fatalf("append after upgrade: %v %v", got, err)
+			}
+		})
+	}
+}

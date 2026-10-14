@@ -1,12 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"encoding/gob"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
 
+	"6.5840/paxos/checksum"
 	"6.5840/paxos/consensus"
 	"6.5840/paxos/kv"
 	"6.5840/paxos/types"
@@ -46,13 +48,16 @@ func TestLegacyKVSnapshotMigratesAndPreservesDedup(t *testing.T) {
 	if store.Get("k") != "newer" || state.Applied != 3 || state.MaxSeq != 4 || state.ProposalNumber != term || state.Requests[op.ReqID].Op != kv.Encode(op) || state.Insts[3].Result != "newer" || state.Insts[4].Decided || state.Insts[4].Op != kv.Encode(old.Insts[4].Op) {
 		t.Fatalf("migration lost application/protocol state: %+v", state)
 	}
-	file, err = os.Open(path)
+	checked, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := checksum.Decode(checked)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var upgraded consensus.Snapshot
-	err = gob.NewDecoder(file).Decode(&upgraded)
-	file.Close()
+	err = gob.NewDecoder(bytes.NewReader(payload)).Decode(&upgraded)
 	if err != nil || upgraded.Version != consensus.SnapshotVersion {
 		t.Fatalf("migration not durably written: %v", err)
 	}

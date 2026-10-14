@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"io"
 	"maps"
 	"net"
 	"net/rpc"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"6.5840/paxos/checksum"
 	"6.5840/paxos/kv"
 	"6.5840/paxos/types"
 )
@@ -278,7 +280,7 @@ func TestSnapshotValidation(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				err = gob.NewEncoder(file).Encode(snapshot)
+				err = checksum.Write(file, func(writer io.Writer) error { return gob.NewEncoder(writer).Encode(snapshot) })
 				file.Close()
 				if err != nil {
 					t.Fatal(err)

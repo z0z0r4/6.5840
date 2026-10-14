@@ -1,10 +1,10 @@
 package consensus
 
 import (
-	"6.5840/paxos/wal"
 	"bytes"
 	"encoding/gob"
 	"fmt"
+	"io"
 	"maps"
 	"math"
 	"os"
@@ -12,10 +12,12 @@ import (
 	"slices"
 	"time"
 
+	"6.5840/paxos/checksum"
 	"6.5840/paxos/types"
+	"6.5840/paxos/wal"
 )
 
-const SnapshotVersion = 6
+const SnapshotVersion = 7
 const snapshotVersion = SnapshotVersion
 
 // Snapshot is the durable consensus state, including an opaque machine image.
@@ -46,18 +48,28 @@ func (s *Node) loadSnapshot(upgrade func([]byte) (Snapshot, error)) (bool, error
 	if err != nil {
 		return false, err
 	}
+	checked := bytes.HasPrefix(data, []byte(checksum.Magic))
+	if checked {
+		data, err = checksum.Decode(data)
+		if err != nil {
+			return false, fmt.Errorf("verify snapshot %s: %w", s.statePath, err)
+		}
+	}
 	var header struct{ Version int }
 	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&header); err != nil {
 		return false, fmt.Errorf("decode %s: %w", s.statePath, err)
 	}
+	if !checked && header.Version >= snapshotVersion {
+		return false, fmt.Errorf("snapshot %s requires a checksum envelope", s.statePath)
+	}
 	var snapshot Snapshot
-	migrated := header.Version != snapshotVersion
-	if header.Version == 5 {
-		// Version 5 used the same opaque state schema but had no WAL requirement.
-		// Publish version 6 before recovery so older binaries cannot ignore a WAL.
+	migrated := !checked || header.Version != snapshotVersion
+	if header.Version == 5 || header.Version == 6 {
+		// Versions 5 and 6 share the opaque state schema but lack integrity
+		// protection. Rewrite them into a checked version 7 image on startup.
 		err = gob.NewDecoder(bytes.NewReader(data)).Decode(&snapshot)
 		snapshot.Version = snapshotVersion
-	} else if migrated {
+	} else if header.Version != snapshotVersion {
 		if upgrade == nil {
 			return false, fmt.Errorf("unsupported snapshot version %d", header.Version)
 		}
@@ -116,7 +128,7 @@ func (s *Node) writeSnapshotLocked(sequence uint64) error {
 		WALSequence: sequence, Checkpoint: s.checkpoint, Version: snapshotVersion, Peers: s.peers, Insts: s.insts, State: s.machine.Snapshot(), MachineKind: s.machine.Kind(), Requests: s.requests,
 		MaxSeq: s.max_seq, Applied: s.applied, RoundNum: s.round_num, PromisedProposalNumber: s.promisedProposalNumber,
 	}
-	if err := gob.NewEncoder(file).Encode(snapshot); err != nil {
+	if err := checksum.Write(file, func(writer io.Writer) error { return gob.NewEncoder(writer).Encode(snapshot) }); err != nil {
 		file.Close()
 		return err
 	}

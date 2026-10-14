@@ -6,18 +6,19 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
+
+	"6.5840/paxos/checksum"
 )
 
-var magic = []byte{'P', 'X', 'W', 'A', 'L', 0, 1, '\n'}
-var checksumTable = crc32.MakeTable(crc32.Castagnoli)
+var magic = []byte{'P', 'X', 'W', 'A', 'L', 0, 2, '\n'}
+var legacyMagic = []byte{'P', 'X', 'W', 'A', 'L', 0, 1, '\n'}
 
 const headerSize = 12
 const MaxRecordBytes = 256 << 20
-const FileHeaderBytes = 8
+const FileHeaderBytes = 12
 
 // Append syncs a complete frame before returning. A failure poisons the writer:
 // the caller must stop and recover the valid prefix before writing again.
@@ -39,12 +40,12 @@ func Append(path string, payload []byte) (int64, error) {
 	}
 	var frame bytes.Buffer
 	if stat.Size() == 0 {
-		frame.Write(magic)
+		frame.Write(fileHeader())
 	}
 	header := make([]byte, headerSize)
 	binary.LittleEndian.PutUint32(header, uint32(len(payload)))
-	binary.LittleEndian.PutUint32(header[4:], crc32.Checksum(payload, checksumTable))
-	binary.LittleEndian.PutUint32(header[8:], crc32.Checksum(header[:8], checksumTable))
+	binary.LittleEndian.PutUint32(header[4:], checksum.Sum(payload))
+	binary.LittleEndian.PutUint32(header[8:], checksum.Sum(header[:8]))
 	frame.Write(header)
 	frame.Write(payload)
 	n, err := file.Write(frame.Bytes())
@@ -82,45 +83,73 @@ func Replay(path string, visit func([]byte) error) (int64, error) {
 	prefix := make([]byte, len(magic))
 	n, err := io.ReadFull(file, prefix)
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
-		if !bytes.Equal(prefix[:n], magic[:n]) {
-			return 0, fmt.Errorf("invalid WAL magic")
+		if !bytes.Equal(prefix[:n], magic[:n]) && !bytes.Equal(prefix[:n], legacyMagic[:n]) {
+			return 0, fmt.Errorf("%w: invalid WAL magic", checksum.ErrCorrupt)
 		}
 		return repairTail(file, 0)
 	}
 	if err != nil {
 		return 0, err
 	}
-	if !bytes.Equal(prefix, magic) {
-		return 0, fmt.Errorf("invalid WAL magic")
-	}
+	legacy := bytes.Equal(prefix, legacyMagic)
 	offset := int64(len(magic))
+	if bytes.Equal(prefix, magic) {
+		digest := make([]byte, 4)
+		if _, err := io.ReadFull(file, digest); err == io.EOF || err == io.ErrUnexpectedEOF {
+			return repairTail(file, 0)
+		} else if err != nil {
+			return 0, err
+		}
+		if binary.LittleEndian.Uint32(digest) != checksum.Sum(prefix) {
+			return 0, fmt.Errorf("%w: WAL file header checksum mismatch", checksum.ErrCorrupt)
+		}
+		offset = FileHeaderBytes
+	} else if !legacy {
+		return 0, fmt.Errorf("%w: invalid WAL magic", checksum.ErrCorrupt)
+	}
+	finish := func(offset int64, repair bool) (int64, error) {
+		if repair {
+			if _, err := repairTail(file, offset); err != nil {
+				return 0, err
+			}
+		}
+		if legacy {
+			// Upgrade only after every complete frame and its application record have
+			// been validated. The body remains byte-for-byte unchanged.
+			if err := upgradeHeader(path, file, offset); err != nil {
+				return 0, err
+			}
+			return offset + 4, nil
+		}
+		return offset, nil
+	}
 	header := make([]byte, headerSize)
 	for {
 		_, err := io.ReadFull(file, header)
 		if err == io.EOF {
-			return offset, nil
+			return finish(offset, false)
 		}
 		if err == io.ErrUnexpectedEOF {
-			return repairTail(file, offset)
+			return finish(offset, true)
 		}
 		if err != nil {
 			return 0, err
 		}
-		if crc32.Checksum(header[:8], checksumTable) != binary.LittleEndian.Uint32(header[8:]) {
-			return 0, fmt.Errorf("WAL header checksum mismatch at %d", offset)
+		if checksum.Sum(header[:8]) != binary.LittleEndian.Uint32(header[8:]) {
+			return 0, fmt.Errorf("%w: WAL header checksum mismatch at %d", checksum.ErrCorrupt, offset)
 		}
 		size := binary.LittleEndian.Uint32(header)
 		if size == 0 || size > MaxRecordBytes {
-			return 0, fmt.Errorf("invalid WAL record length %d at %d", size, offset)
+			return 0, fmt.Errorf("%w: invalid WAL record length %d at %d", checksum.ErrCorrupt, size, offset)
 		}
 		payload := make([]byte, int(size))
 		if _, err := io.ReadFull(file, payload); err == io.EOF || err == io.ErrUnexpectedEOF {
-			return repairTail(file, offset)
+			return finish(offset, true)
 		} else if err != nil {
 			return 0, err
 		}
-		if crc32.Checksum(payload, checksumTable) != binary.LittleEndian.Uint32(header[4:]) {
-			return 0, fmt.Errorf("WAL payload checksum mismatch at %d", offset)
+		if checksum.Sum(payload) != binary.LittleEndian.Uint32(header[4:]) {
+			return 0, fmt.Errorf("%w: WAL payload checksum mismatch at %d", checksum.ErrCorrupt, offset)
 		}
 		if err := visit(payload); err != nil {
 			return 0, fmt.Errorf("WAL record at %d: %w", offset, err)
@@ -128,6 +157,41 @@ func Replay(path string, visit func([]byte) error) (int64, error) {
 		offset += int64(headerSize) + int64(size)
 	}
 }
+
+func fileHeader() []byte {
+	header := make([]byte, FileHeaderBytes)
+	copy(header, magic)
+	binary.LittleEndian.PutUint32(header[len(magic):], checksum.Sum(magic))
+	return header
+}
+func upgradeHeader(path string, source *os.File, size int64) error {
+	target, err := os.CreateTemp(filepath.Dir(path), ".wal-*.tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(target.Name())
+	defer target.Close()
+	if _, err := target.Write(fileHeader()); err != nil {
+		return err
+	}
+	if _, err := source.Seek(int64(len(legacyMagic)), io.SeekStart); err != nil {
+		return err
+	}
+	if _, err := io.CopyN(target, source, size-int64(len(legacyMagic))); err != nil {
+		return err
+	}
+	if err := target.Sync(); err != nil {
+		return err
+	}
+	if err := target.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(target.Name(), path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
 func repairTail(file *os.File, offset int64) (int64, error) {
 	if err := file.Truncate(offset); err != nil {
 		return 0, err
@@ -150,7 +214,7 @@ func Reset(path string) error {
 		return err
 	}
 	defer os.Remove(file.Name())
-	if _, err := file.Write(magic); err != nil {
+	if _, err := file.Write(fileHeader()); err != nil {
 		file.Close()
 		return err
 	}

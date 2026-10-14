@@ -703,7 +703,7 @@ func TestQueuedProposalCancellation(t *testing.T) {
 	s.proposalSlot <- struct{}{}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan proposalResult, 1)
-	go func() { done <- s.propose(ctx, OP{Action: "get", Key: "k"}) }()
+	go func() { done <- s.waitForProposal(ctx, OP{Action: "get", Key: "k"}) }()
 	cancel()
 	select {
 	case result := <-done:
@@ -715,10 +715,11 @@ func TestQueuedProposalCancellation(t *testing.T) {
 		t.Fatal("queued proposal ignored cancellation")
 	}
 	<-s.proposalSlot
+	waitPendingDrained(t, s)
 	if s.max_seq != 0 || !s.readyLocked() {
 		t.Fatal("queued cancellation mutated log or leadership")
 	}
-	result := s.propose(context.Background(), OP{ReqID: newRequestID(), Action: "set", Key: "k", Value: "ok"})
+	result := s.waitForProposal(context.Background(), OP{ReqID: newRequestID(), Action: "set", Key: "k", Value: "ok"})
 	if result.status != proposalApplied {
 		t.Fatalf("cancellation prevented the next proposal: %+v", result)
 	}
@@ -951,7 +952,7 @@ func TestHigherProposalNumberInvalidatesLeader(t *testing.T) {
 				t.Fatal("old-term failure changed the leadership")
 			}
 			s.mu.Unlock()
-			result := s.propose(context.Background(), OP{Action: "get", Key: "k"})
+			result := s.waitForProposal(context.Background(), OP{Action: "get", Key: "k"})
 			if result.status != proposalRedirect || result.leader != leader {
 				t.Fatalf("old leader served a new proposal: %+v", result)
 			}
@@ -1173,8 +1174,7 @@ func TestFiveNodeQuorumLoss(t *testing.T) {
 			continue
 		}
 		var reply ClientSetReply
-		deadline := time.Now().Add(250 * time.Millisecond)
-		err := callWithTimeout(c.peers[i], "Server.Set", &ClientSetRequest{ReqID: newRequestID(), Key: "uncertain", Value: "maybe", DeadlineUnixNano: deadline.UnixNano()}, &reply, 2*time.Second)
+		err := callWithTimeout(c.peers[i], "Server.Set", &ClientSetRequest{ReqID: newRequestID(), Key: "uncertain", Value: "maybe", TimeoutMs: 250}, &reply, 2*time.Second)
 		if err != nil {
 			t.Fatalf("bounded Set on node %d did not return: %v", i, err)
 		}
@@ -1340,8 +1340,7 @@ func TestFiveNodePartitions(t *testing.T) {
 	majority := []int{(l + 2) % 5, (l + 3) % 5, (l + 4) % 5}
 	c.partition(minority, majority)
 	var reply ClientSetReply
-	deadline := time.Now().Add(400 * time.Millisecond)
-	err := callWithTimeout(c.peers[l], "Server.Set", &ClientSetRequest{ReqID: newRequestID(), Key: "pending", Value: "minority", DeadlineUnixNano: deadline.UnixNano()}, &reply, 2*time.Second)
+	err := callWithTimeout(c.peers[l], "Server.Set", &ClientSetRequest{ReqID: newRequestID(), Key: "pending", Value: "minority", TimeoutMs: 400}, &reply, 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1448,8 +1447,7 @@ func TestFiveNodeAbandonedProposal(t *testing.T) {
 		}
 	}
 	var reply ClientSetReply
-	deadline := time.Now().Add(60 * time.Millisecond)
-	err := callWithTimeout(c.peers[leader.ID], "Server.Set", &ClientSetRequest{ReqID: newRequestID(), Key: "abandoned", Value: "uncertain", DeadlineUnixNano: deadline.UnixNano()}, &reply, time.Second)
+	err := callWithTimeout(c.peers[leader.ID], "Server.Set", &ClientSetRequest{ReqID: newRequestID(), Key: "abandoned", Value: "uncertain", TimeoutMs: 60}, &reply, time.Second)
 	if err != nil || reply.Result {
 		t.Fatalf("expected failed proposal: err=%v reply=%+v", err, reply)
 	}
@@ -1460,11 +1458,15 @@ func TestFiveNodeAbandonedProposal(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Healthy heartbeats alone cannot heal an accepted-but-undecided slot. A
-	// timeout must force recovery before new requests are assigned later slots.
+	// The original worker must finish its slot after the handler stops waiting,
+	// before later operations are assigned slots.
 	c.set("abandoned", "resolved")
 	c.set("next", "ok")
 	c.converge(map[string]string{"base": "ok", "abandoned": "resolved", "next": "ok"})
+	state, err := c.state(leader.ID)
+	if err != nil || !state.Ready || state.ProposalNumber != leader.ProposalNumber {
+		t.Fatalf("handler timeout changed leader term: %+v %v", state, err)
+	}
 }
 
 func TestFiveNodeCompactionRecovery(t *testing.T) {
@@ -1472,7 +1474,7 @@ func TestFiveNodeCompactionRecovery(t *testing.T) {
 	id := newRequestID()
 	leader := c.leader().ID
 	var reply ClientSetReply
-	if err := call(c.peers[leader], "Server.Set", &ClientSetRequest{ReqID: id, Key: "k", Value: "original", DeadlineUnixNano: time.Now().Add(time.Second).UnixNano()}, &reply); err != nil || !reply.Result {
+	if err := call(c.peers[leader], "Server.Set", &ClientSetRequest{ReqID: id, Key: "k", Value: "original", TimeoutMs: 1000}, &reply); err != nil || !reply.Result {
 		t.Fatalf("initial write: %v %+v", err, reply)
 	}
 	follower := (leader + 1) % 5
@@ -1514,7 +1516,7 @@ func TestFiveNodeCompactionRecovery(t *testing.T) {
 	c.converge(want)
 	leader = c.leader().ID
 	reply = ClientSetReply{}
-	if err := call(c.peers[leader], "Server.Set", &ClientSetRequest{ReqID: id, Key: "k", Value: "original", DeadlineUnixNano: time.Now().Add(time.Second).UnixNano()}, &reply); err != nil || !reply.Result {
+	if err := call(c.peers[leader], "Server.Set", &ClientSetRequest{ReqID: id, Key: "k", Value: "original", TimeoutMs: 1000}, &reply); err != nil || !reply.Result {
 		t.Fatalf("compacted duplicate: %v %+v", err, reply)
 	}
 	c.converge(want)
@@ -1540,7 +1542,7 @@ func TestFiveNodeRequestDeduplication(t *testing.T) {
 		for time.Now().Before(until) {
 			leader := c.leader().ID
 			var reply ClientSetReply
-			err := callWithTimeout(c.peers[leader], "Server.Set", &ClientSetRequest{ReqID: id, Key: "k", Value: "once", DeadlineUnixNano: until.UnixNano()}, &reply, time.Second)
+			err := callWithTimeout(c.peers[leader], "Server.Set", &ClientSetRequest{ReqID: id, Key: "k", Value: "once", TimeoutMs: time.Until(until).Milliseconds()}, &reply, time.Second)
 			if err == nil && reply.Result {
 				return
 			}
@@ -1559,7 +1561,7 @@ func TestFiveNodeRequestDeduplication(t *testing.T) {
 	proxy.count = 10
 	proxy.mu.Unlock()
 	var reply ClientSetReply
-	err = callWithTimeout(proxy.listener.Addr().String(), "Server.Set", &ClientSetRequest{ReqID: id, Key: "k", Value: "once", DeadlineUnixNano: time.Now().Add(time.Second).UnixNano()}, &reply, time.Second)
+	err = callWithTimeout(proxy.listener.Addr().String(), "Server.Set", &ClientSetRequest{ReqID: id, Key: "k", Value: "once", TimeoutMs: 1000}, &reply, time.Second)
 	proxy.close()
 	if err == nil {
 		t.Fatal("response-loss RPC unexpectedly succeeded")
@@ -1580,7 +1582,7 @@ func TestFiveNodeRequestDeduplication(t *testing.T) {
 	// Reusing the ID with a different payload is rejected.
 	leader = c.leader().ID
 	reply = ClientSetReply{}
-	err = call(c.peers[leader], "Server.Set", &ClientSetRequest{ReqID: id, Key: "k", Value: "bad", DeadlineUnixNano: time.Now().Add(time.Second).UnixNano()}, &reply)
+	err = call(c.peers[leader], "Server.Set", &ClientSetRequest{ReqID: id, Key: "k", Value: "bad", TimeoutMs: 1000}, &reply)
 	if err != nil || reply.Result {
 		t.Fatalf("conflicting ID: reply=%+v err=%v", reply, err)
 	}
@@ -1629,25 +1631,25 @@ func TestFiveNodeClientRetriesSameUUID(t *testing.T) {
 	}
 }
 
-func TestRequestDeadlineBounds(t *testing.T) {
-	for _, requested := range []int64{0, time.Now().Add(time.Hour).UnixNano(), time.Now().Add(-time.Second).UnixNano()} {
+func TestHandlerWaitBudgetBounds(t *testing.T) {
+	for _, requested := range []int64{0, -1, 50, 1<<63 - 1} {
 		before := time.Now()
-		ctx, cancel := requestContext(requested)
+		ctx, cancel := handlerWaitContext(requested)
+		after := time.Now()
 		deadline, ok := ctx.Deadline()
-		if !ok || deadline.After(before.Add(clientTimeout+time.Millisecond)) {
-			t.Fatal("request has no bounded server deadline")
+		limit := serverWaitTimeout
+		if requested == 50 {
+			limit = 50 * time.Millisecond
 		}
-		if requested < 0 || (requested != 0 && requested < before.UnixNano()) {
-			if ctx.Err() == nil {
-				t.Fatal("expired request was extended")
-			}
+		if !ok || deadline.After(after.Add(limit)) || deadline.Before(before.Add(limit)) {
+			t.Fatal("handler budget not bounded using local time")
 		}
 		cancel()
 	}
 }
 
-func TestAcceptQuorumHonorsRequestDeadline(t *testing.T) {
-	// A peer accepts TCP but never replies. Cancellation must beat rpcTimeout.
+func TestAcceptQuorumUsesPeerTimeout(t *testing.T) {
+	// A silent peer is bounded by the transport timeout, independently of callers.
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1661,14 +1663,12 @@ func TestAcceptQuorumHonorsRequestDeadline(t *testing.T) {
 		}
 	}()
 	s := newProtocolServer(t, []string{"p0", l.Addr().String()})
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
 	start := time.Now()
-	if votes := s.broadcastAcceptContext(ctx, 1, types.ProposalID{Round: 1, NodeID: 0}, OP{Action: "nop"}); votes >= s.majority {
+	if votes := s.broadcastAccept(1, types.ProposalID{Round: 1, NodeID: 0}, OP{Action: "nop"}); votes >= s.majority {
 		t.Fatal("silent peer formed a majority")
 	}
-	if time.Since(start) > 300*time.Millisecond {
-		t.Fatal("request waited for full node RPC timeout")
+	if time.Since(start) > rpcTimeout+300*time.Millisecond {
+		t.Fatal("peer RPC exceeded transport timeout")
 	}
 	select {
 	case conn := <-accepted:
@@ -1790,7 +1790,7 @@ func TestPeriodicHeartbeatRenewsLocalReads(t *testing.T) {
 	s.lastHeartbeatTime = time.Now().Add(-2 * heartbeatTimeout)
 	s.electLeader()
 	decideOperation(t, s, 1, OP{Action: "set", Key: "k", Value: "v"})
-	if r := s.propose(context.Background(), OP{Action: "get", Key: "k"}); r.status != proposalApplied || r.value != "v" || s.max_seq != 2 || s.applied != 2 || !s.readyLocked() || !s.readLeaseUntil.IsZero() {
+	if r := s.waitForProposal(context.Background(), OP{Action: "get", Key: "k"}); r.status != proposalApplied || r.value != "v" || s.max_seq != 2 || s.applied != 2 || !s.readyLocked() || !s.readLeaseUntil.IsZero() {
 		t.Fatalf("read without a lease did not fall back to a proposal: %+v", r)
 	}
 	s.StartHeartbeat()
@@ -1828,7 +1828,7 @@ func TestPeriodicHeartbeatRenewsLocalReads(t *testing.T) {
 	until, seq, applied := s.readLeaseUntil, s.max_seq, s.applied
 	s.mu.Unlock()
 	for i := 0; i < 10; i++ {
-		if r := s.propose(context.Background(), OP{Action: "get", Key: "k"}); r.status != proposalApplied || r.value != "v" {
+		if r := s.waitForProposal(context.Background(), OP{Action: "get", Key: "k"}); r.status != proposalApplied || r.value != "v" {
 			t.Fatalf("leased local read: %+v", r)
 		}
 	}
@@ -1839,7 +1839,7 @@ func TestPeriodicHeartbeatRenewsLocalReads(t *testing.T) {
 	}
 	s.readLeaseUntil = time.Now().Add(-time.Second)
 	s.mu.Unlock()
-	if r := s.propose(context.Background(), OP{Action: "get", Key: "k"}); r.status != proposalApplied || r.value != "v" || s.max_seq != seq+1 || s.applied != applied+1 || !s.readyLocked() {
+	if r := s.waitForProposal(context.Background(), OP{Action: "get", Key: "k"}); r.status != proposalApplied || r.value != "v" || s.max_seq != seq+1 || s.applied != applied+1 || !s.readyLocked() {
 		t.Fatalf("expired read lease did not fall back to a proposal: %+v", r)
 	}
 }
@@ -1876,12 +1876,17 @@ func TestHeartbeatWithoutQuorumDoesNotGrantReadLease(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	if r := s.propose(ctx, OP{Action: "get", Key: "k"}); r.status != proposalExpired || s.applied != 0 {
-		t.Fatal("isolated ready leader served a read without quorum lease")
+	if r := s.waitForProposal(ctx, OP{Action: "get", Key: "k"}); r.status != proposalExpired {
+		t.Fatal("isolated leader returned read without quorum")
 	}
-	if s.max_seq != 1 || s.insts[1].Op.Action != "get" || s.insts[1].Decided || len(s.pinnedReads) != 0 {
-		t.Fatal("isolated read did not attempt a proposal or release its pin")
+	s.mu.Lock()
+	if s.applied != 0 || s.max_seq != 1 || s.insts[1].Op.Action != "get" || s.insts[1].Decided || !s.readyLocked() || len(s.pinnedReads) != 1 {
+		s.mu.Unlock()
+		t.Fatal("handler timeout stopped consensus or served a stale read")
 	}
+	s.invalidateLeaderLocked(s.leaderProposalNumber, true)
+	s.mu.Unlock()
+	waitPendingDrained(t, s)
 }
 
 func TestFallbackGetAtCompactionBoundary(t *testing.T) {
@@ -1971,10 +1976,10 @@ func TestFailedLeaseRenewalKeepsLeaderAndAllowsProposals(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if r := s.propose(ctx, OP{ReqID: newRequestID(), Action: "set", Key: "k", Value: "v"}); r.status != proposalApplied {
+	if r := s.waitForProposal(ctx, OP{ReqID: newRequestID(), Action: "set", Key: "k", Value: "v"}); r.status != proposalApplied {
 		t.Fatalf("write after failed lease renewal: %+v", r)
 	}
-	if r := s.propose(ctx, OP{Action: "get", Key: "k"}); r.status != proposalApplied || r.value != "v" {
+	if r := s.waitForProposal(ctx, OP{Action: "get", Key: "k"}); r.status != proposalApplied || r.value != "v" {
 		t.Fatalf("fallback read after failed lease renewal: %+v", r)
 	}
 	s.mu.Lock()
@@ -2003,7 +2008,7 @@ func TestFiveNodePausedMasterLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	var reply ClientGetResponse
-	if err := callWithTimeout(c.peers[old], "Server.Get", &ClientGetRequest{Key: "lease", DeadlineUnixNano: time.Now().Add(250 * time.Millisecond).UnixNano()}, &reply, clientAttemptTimeout); err != nil {
+	if err := callWithTimeout(c.peers[old], "Server.Get", &ClientGetRequest{Key: "lease", TimeoutMs: 250}, &reply, clientAttemptTimeout); err != nil {
 		t.Fatal(err)
 	}
 	if reply.Result {

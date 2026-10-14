@@ -17,13 +17,11 @@ type RequestRecord struct {
 	Seq int
 }
 
-func requestContext(deadlineUnixNano int64) (context.Context, context.CancelFunc) {
-	deadline := time.Now().Add(clientTimeout)
-	if deadlineUnixNano != 0 {
-		requested := time.Unix(0, deadlineUnixNano)
-		if requested.Before(deadline) {
-			deadline = requested
-		}
+// The wire budget limits only the handler's wait, never the consensus worker.
+func handlerWaitContext(timeoutMs int64) (context.Context, context.CancelFunc) {
+	timeout := serverWaitTimeout
+	if timeoutMs > 0 && timeoutMs < serverWaitTimeout.Milliseconds() {
+		timeout = time.Duration(timeoutMs) * time.Millisecond
 	}
-	return context.WithDeadline(context.Background(), deadline)
+	return context.WithTimeout(context.Background(), timeout)
 }

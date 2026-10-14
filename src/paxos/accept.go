@@ -1,10 +1,6 @@
 package paxos
 
-import (
-	"context"
-
-	"6.5840/paxos/types"
-)
+import "6.5840/paxos/types"
 
 func (s *Server) acceptLocked(seq int, proposalNumber types.ProposalID, value OP) bool {
 	if seq <= s.checkpoint.Seq {
@@ -42,13 +38,9 @@ func (s *Server) Accept(args *AcceptArgs, reply *AcceptReply) error {
 }
 
 func (s *Server) broadcastAccept(seq int, proposalNumber types.ProposalID, value OP) int {
-	return s.broadcastAcceptContext(context.Background(), seq, proposalNumber, value)
-}
-
-func (s *Server) broadcastAcceptContext(ctx context.Context, seq int, proposalNumber types.ProposalID, value OP) int {
 	args := AcceptArgs{Seq: seq, ProposalNumber: proposalNumber, Value: value}
-	ch := fanoutContext[AcceptReply](ctx, s, "Server.Accept", &args, func(a, r any) error {
+	ch := fanout[AcceptReply](s, "Server.Accept", &args, func(a, r any) error {
 		return s.Accept(a.(*AcceptArgs), r.(*AcceptReply))
 	})
-	return countQuorumContext(ctx, s, ch, func(r AcceptReply) bool { return r.Accepted })
+	return countQuorum(s, ch, func(r AcceptReply) bool { return r.Accepted })
 }

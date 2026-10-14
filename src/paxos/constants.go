@@ -4,6 +4,8 @@ import "time"
 
 const (
 	rpcTimeout           = 500 * time.Millisecond
+	serverWaitTimeout    = 10 * time.Second
+	maxPendingProposals  = 128
 	clientTimeout        = 10 * time.Second
 	clientAttemptTimeout = 2 * time.Second
 	// Leases assume bounded clock-rate drift; the master expires before replicas.

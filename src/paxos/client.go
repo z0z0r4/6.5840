@@ -1,6 +1,12 @@
 package paxos
 
-import "time"
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+var ErrRequestConflict = errors.New("paxos: request ID reused with different operation")
 
 type Client struct {
 	target_server string
@@ -15,41 +21,69 @@ func (c *Client) InitPeers(peers []string) {
 	}
 }
 
-func (c *Client) Send_set(key string, value string) bool {
+// SetContext bounds waiting and retries. A timeout leaves the write outcome
+// unknown; retries within this call use the same request ID.
+func (c *Client) SetContext(ctx context.Context, key, value string) error {
 	reqID := newRequestID()
-	deadline := time.Now().Add(clientTimeout)
-	for attempt := 0; time.Now().Before(deadline); attempt++ {
-		attemptDeadline := time.Now().Add(clientAttemptTimeout)
-		if deadline.Before(attemptDeadline) {
-			attemptDeadline = deadline
-		}
+	return c.retry(ctx, func(attemptCtx context.Context, budget int64) (bool, string, proposalStatus, error) {
 		var reply ClientSetReply
-		err := callWithTimeout(c.target_server, "Server.Set", &ClientSetRequest{ReqID: reqID, Key: key, Value: value, DeadlineUnixNano: attemptDeadline.UnixNano()}, &reply, time.Until(attemptDeadline))
+		err := callWithContext(attemptCtx, c.target_server, "Server.Set", &ClientSetRequest{ReqID: reqID, Key: key, Value: value, TimeoutMs: budget}, &reply)
+		return reply.Result, reply.LeaderAddress, reply.Status, err
+	})
+}
+
+func (c *Client) GetContext(ctx context.Context, key string) (string, error) {
+	var value string
+	err := c.retry(ctx, func(attemptCtx context.Context, budget int64) (bool, string, proposalStatus, error) {
+		var reply ClientGetResponse
+		err := callWithContext(attemptCtx, c.target_server, "Server.Get", &ClientGetRequest{Key: key, TimeoutMs: budget}, &reply)
 		if err == nil && reply.Result {
-			return true
+			value = reply.Value
 		}
-		c.nextTarget(reply.LeaderAddress, attempt)
-		waitForRetry(deadline)
+		return reply.Result, reply.LeaderAddress, reply.Status, err
+	})
+	return value, err
+}
+
+func (c *Client) retry(ctx context.Context, invoke func(context.Context, int64) (bool, string, proposalStatus, error)) error {
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, clientAttemptTimeout)
+		deadline, _ := attemptCtx.Deadline()
+		// Round up so a positive sub-millisecond budget never means "use default".
+		budget := max(int64(1), int64((time.Until(deadline)+time.Millisecond-1)/time.Millisecond))
+		ok, leader, status, err := invoke(attemptCtx, budget)
+		cancel()
+		if err == nil && ok {
+			return nil
+		}
+		if err == nil && status == proposalConflict {
+			return ErrRequestConflict
+		}
+		c.nextTarget(leader, attempt)
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
-	return false
+}
+
+func (c *Client) Send_set(key, value string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), clientTimeout)
+	defer cancel()
+	return c.SetContext(ctx, key, value) == nil
 }
 
 func (c *Client) Send_get(key string) (bool, string) {
-	deadline := time.Now().Add(clientTimeout)
-	for attempt := 0; time.Now().Before(deadline); attempt++ {
-		attemptDeadline := time.Now().Add(clientAttemptTimeout)
-		if deadline.Before(attemptDeadline) {
-			attemptDeadline = deadline
-		}
-		var reply ClientGetResponse
-		err := callWithTimeout(c.target_server, "Server.Get", &ClientGetRequest{Key: key, DeadlineUnixNano: attemptDeadline.UnixNano()}, &reply, time.Until(attemptDeadline))
-		if err == nil && reply.Result {
-			return true, reply.Value
-		}
-		c.nextTarget(reply.LeaderAddress, attempt)
-		waitForRetry(deadline)
-	}
-	return false, ""
+	ctx, cancel := context.WithTimeout(context.Background(), clientTimeout)
+	defer cancel()
+	value, err := c.GetContext(ctx, key)
+	return err == nil, value
 }
 
 func (c *Client) nextTarget(leader string, attempt int) {
@@ -60,13 +94,5 @@ func (c *Client) nextTarget(leader string, attempt int) {
 	}
 }
 
-func (c *Client) Init(target string) { c.target_server = target }
-
+func (c *Client) Init(target string)         { c.target_server = target }
 func (c *Client) Set(key, value string) bool { return c.Send_set(key, value) }
-
-func waitForRetry(deadline time.Time) {
-	delay := min(retryInterval, time.Until(deadline))
-	if delay > 0 {
-		time.Sleep(delay)
-	}
-}

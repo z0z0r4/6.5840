@@ -1,7 +1,6 @@
 package paxos
 
 import (
-	"context"
 	"encoding/gob"
 	"fmt"
 	"log"
@@ -27,11 +26,13 @@ type Server struct {
 	majority   int
 	statePath  string
 
-	insts       map[int]Instance
-	kv          map[string]string
-	requests    map[string]RequestRecord
-	checkpoint  Checkpoint
-	pinnedReads map[int]bool
+	insts         map[int]Instance
+	kv            map[string]string
+	requests      map[string]RequestRecord
+	checkpoint    Checkpoint
+	pinnedReads   map[int]bool
+	pendingWrites map[string]*pendingProposal
+	pendingCount  int
 
 	phase                  leaderPhase
 	catchingUp             bool
@@ -87,20 +88,8 @@ func (s *Server) applyLocked() {
 	}
 }
 
-func (s *Server) propose(ctx context.Context, op OP) proposalResult {
-	// Both proposals and elections own this slot. Queueing remains cancellable.
-	select {
-	case s.proposalSlot <- struct{}{}:
-	case <-ctx.Done():
-		return proposalResult{status: proposalExpired}
-	}
-	defer func() { <-s.proposalSlot }()
-
+func (s *Server) driveProposal(op OP) proposalResult {
 	s.mu.Lock()
-	if ctx.Err() != nil {
-		s.mu.Unlock()
-		return proposalResult{status: proposalExpired}
-	}
 	if !s.readyLocked() {
 		result := proposalResult{status: proposalRedirect, leader: s.leader}
 		s.mu.Unlock()
@@ -131,8 +120,6 @@ func (s *Server) propose(ctx context.Context, op OP) proposalResult {
 
 	s.mu.Unlock()
 
-	completed := false
-
 	defer func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -143,14 +130,9 @@ func (s *Server) propose(ctx context.Context, op OP) proposalResult {
 				delete(s.insts, seq)
 			}
 		}
-
-		// An incomplete Accept may have left a hole. Recover before new slots.
-		if !completed {
-			s.invalidateLeaderLocked(proposalNumber, false)
-		}
 	}()
 
-	for ctx.Err() == nil {
+	for {
 		s.mu.Lock()
 		// 释放锁后重新检查
 		active := s.readyLocked() && s.inLeaderProposalNumberLocked(proposalNumber)
@@ -161,25 +143,19 @@ func (s *Server) propose(ctx context.Context, op OP) proposalResult {
 			return proposalResult{status: proposalRedirect, leader: leader}
 		}
 
-		if s.broadcastAcceptContext(ctx, seq, proposalNumber, op) >= s.majority {
+		if s.broadcastAccept(seq, proposalNumber, op) >= s.majority {
 			s.announceDecision(seq, Instance{ProposalAcceptNumber: proposalNumber, Op: op, Decided: true})
 
 			s.mu.Lock()
 			result := s.proposedResultLocked(seq, op)
 			s.mu.Unlock()
 
-			completed = result.status == proposalApplied
 			return result
 		}
 
-		// 等待 30ms 后重试，或者直到上下文过期
-		select {
-		case <-ctx.Done():
-			return proposalResult{status: proposalExpired}
-		case <-time.After(retryInterval):
-		}
+		// Retry the same slot and value until chosen or leadership changes.
+		time.Sleep(retryInterval)
 	}
-	return proposalResult{status: proposalExpired}
 }
 
 // Recheck heartbeat expiration after acquiring the proposal slot.
@@ -265,18 +241,20 @@ func (s *Server) Set(args *ClientSetRequest, reply *ClientSetReply) error {
 	if args.ReqID == "" {
 		return fmt.Errorf("write requires ReqID")
 	}
-	ctx, cancel := requestContext(args.DeadlineUnixNano)
+	ctx, cancel := handlerWaitContext(args.TimeoutMs)
 	defer cancel()
-	result := s.propose(ctx, OP{ReqID: args.ReqID, Action: "set", Key: args.Key, Value: args.Value})
+	result := s.waitForProposal(ctx, OP{ReqID: args.ReqID, Action: "set", Key: args.Key, Value: args.Value})
+	reply.Status = result.status
 	reply.Result = result.status == proposalApplied
 	reply.LeaderAddress = s.redirectAddress(result)
 	return nil
 }
 
 func (s *Server) Get(args *ClientGetRequest, reply *ClientGetResponse) error {
-	ctx, cancel := requestContext(args.DeadlineUnixNano)
+	ctx, cancel := handlerWaitContext(args.TimeoutMs)
 	defer cancel()
-	result := s.propose(ctx, OP{Action: "get", Key: args.Key})
+	result := s.waitForProposal(ctx, OP{Action: "get", Key: args.Key})
+	reply.Status = result.status
 	reply.Result = result.status == proposalApplied
 	reply.Value = result.value
 	reply.LeaderAddress = s.redirectAddress(result)

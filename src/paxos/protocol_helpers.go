@@ -1,7 +1,6 @@
 package paxos
 
 import (
-	"context"
 	"log"
 	"time"
 
@@ -23,6 +22,7 @@ const (
 	proposalRedirect
 	proposalApplied
 	proposalConflict
+	proposalBusy
 )
 
 type proposalResult struct {
@@ -131,10 +131,6 @@ type rpcResult[T any] struct {
 
 // 发出 RPC 调用到所有节点，分别本地调用和远程调用，并收集响应到 channel 中并返回
 func fanout[T any](s *Server, method string, args any, local func(any, any) error) <-chan rpcResult[T] {
-	return fanoutContext[T](context.Background(), s, method, args, local)
-}
-
-func fanoutContext[T any](ctx context.Context, s *Server, method string, args any, local func(any, any) error) <-chan rpcResult[T] {
 	ch := make(chan rpcResult[T], len(s.peers))
 	var reply T
 	err := local(args, &reply)
@@ -145,9 +141,7 @@ func fanoutContext[T any](ctx context.Context, s *Server, method string, args an
 		}
 		go func(peer string) {
 			var reply T
-			rpcCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
-			defer cancel()
-			err := callWithContext(rpcCtx, peer, method, args, &reply)
+			err := call(peer, method, args, &reply)
 			ch <- rpcResult[T]{reply: reply, err: err}
 		}(peer)
 	}
@@ -171,18 +165,10 @@ func (q quorumVotes) done() bool {
 }
 
 func countQuorum[T any](s *Server, ch <-chan rpcResult[T], accepted func(T) bool) int {
-	return countQuorumContext(context.Background(), s, ch, accepted)
-}
-
-func countQuorumContext[T any](ctx context.Context, s *Server, ch <-chan rpcResult[T], accepted func(T) bool) int {
 	q := quorumVotes{total: len(s.peers), majority: s.majority}
 	for !q.done() {
-		select {
-		case <-ctx.Done():
-			return q.yes
-		case r := <-ch:
-			q.record(r.err == nil && accepted(r.reply))
-		}
+		r := <-ch
+		q.record(r.err == nil && accepted(r.reply))
 	}
 	return q.yes
 }

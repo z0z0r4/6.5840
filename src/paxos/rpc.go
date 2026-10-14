@@ -17,13 +17,14 @@ type OP struct {
 }
 
 type ClientSetRequest struct {
-	ReqID            string
-	Key              string
-	Value            string
-	DeadlineUnixNano int64
+	ReqID     string
+	Key       string
+	Value     string
+	TimeoutMs int64
 }
 
 type ClientSetReply struct {
+	Status        proposalStatus
 	Result        bool
 	IsLeader      bool
 	LeaderID      int
@@ -31,11 +32,12 @@ type ClientSetReply struct {
 }
 
 type ClientGetRequest struct {
-	Key              string
-	DeadlineUnixNano int64
+	Key       string
+	TimeoutMs int64
 }
 
 type ClientGetResponse struct {
+	Status proposalStatus
 	Result bool
 	Value  string
 
@@ -138,5 +140,9 @@ func callWithContext(ctx context.Context, peer, method string, args, reply any) 
 	defer stop()
 	client := rpc.NewClient(conn)
 	defer client.Close()
-	return client.Call(method, args, reply)
+	err = client.Call(method, args, reply)
+	if err != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
 }

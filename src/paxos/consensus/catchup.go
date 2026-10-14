@@ -1,11 +1,11 @@
-package paxos
+package consensus
 
 import "6.5840/paxos/types"
 
-const catchUpBatchSize = 64
+const CatchUpBatchSize = 64
 
 // FetchLog returns only a contiguous prefix of decided entries, never accepted values.
-func (s *Server) FetchLog(args *FetchLogArgs, reply *FetchLogReply) error {
+func (s *Node) FetchLog(args *FetchLogArgs, reply *FetchLogReply) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.inLeaderProposalNumberLocked(args.ProposalNumber) || args.StartSeq < 1 {
@@ -18,7 +18,7 @@ func (s *Server) FetchLog(args *FetchLogArgs, reply *FetchLogReply) error {
 	if start <= s.checkpoint.Seq {
 		start = s.checkpoint.Seq + 1
 	}
-	for seq := start; seq <= s.applied && len(reply.Entries) < catchUpBatchSize; seq++ {
+	for seq := start; seq <= s.applied && len(reply.Entries) < CatchUpBatchSize; seq++ {
 		inst, exists := s.insts[seq]
 		if !exists || !inst.Decided {
 			break
@@ -30,7 +30,7 @@ func (s *Server) FetchLog(args *FetchLogArgs, reply *FetchLogReply) error {
 }
 
 // catchUp is retriggered by a subsequent heartbeat if a fetch fails or the leader changes.
-func (s *Server) catchUp(leader int, proposalNumber types.ProposalID, target int) {
+func (s *Node) catchUp(leader int, proposalNumber types.ProposalID, target int) {
 	defer func() {
 		s.mu.Lock()
 		s.catchingUp = false

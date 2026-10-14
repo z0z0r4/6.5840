@@ -1,36 +1,31 @@
-package paxos
+package consensus
 
 import (
-	"encoding/gob"
-	"fmt"
-	"log"
-	"net"
-	"net/rpc"
-	"os"
 	"sync"
 	"time"
 
+	"6.5840/paxos/statemachine"
 	"6.5840/paxos/types"
 )
 
 type Instance struct {
 	ProposalAcceptNumber types.ProposalID
-	Op                   OP
+	Op                   Command
 	Decided              bool
-	ReadValue            string
+	Result               string
 }
 
-type Server struct {
+type Node struct {
 	own_number int
 	peers      []string
 	majority   int
 	statePath  string
 
 	insts         map[int]Instance
-	kv            map[string]string
+	machine       statemachine.Machine
 	requests      map[string]RequestRecord
 	checkpoint    Checkpoint
-	pinnedReads   map[int]bool
+	pinnedResults map[int]bool
 	pendingWrites map[string]*pendingProposal
 	pendingCount  int
 
@@ -54,8 +49,8 @@ type Server struct {
 	mu sync.Mutex
 }
 
-// Try to applyLocked all decided OP in order from applied+1 until the first undecided OP
-func (s *Server) applyLocked() {
+// Try to applyLocked all decided Command in order from applied+1 until the first undecided Command
+func (s *Node) applyLocked() {
 	defer s.compactLocked()
 	for {
 		next_seq_apply := s.applied + 1
@@ -70,52 +65,47 @@ func (s *Server) applyLocked() {
 				s.applied++
 				continue
 			}
-			s.requests[inst.Op.ReqID] = RequestRecord{Op: inst.Op, Seq: next_seq_apply}
 		}
-		switch inst.Op.Action {
-		case "set":
-			s.kv[inst.Op.Key] = inst.Op.Value
-		case "get":
-			inst.ReadValue = s.kv[inst.Op.Key]
+		if !inst.Op.Noop {
+			inst.Result = s.machine.Apply(inst.Op)
 			s.insts[next_seq_apply] = inst
-		case "nop":
-			// do nothing
-		default:
-			fmt.Println("Unknown action:", inst.Op.Action)
+		}
+		if inst.Op.ReqID != "" {
+			s.requests[inst.Op.ReqID] = RequestRecord{Op: inst.Op, Seq: next_seq_apply, Result: inst.Result}
 		}
 
 		s.applied++
 	}
 }
 
-func (s *Server) driveProposal(op OP) proposalResult {
+func (s *Node) driveProposal(op Command) Result {
 	s.mu.Lock()
 	if !s.readyLocked() {
-		result := proposalResult{status: proposalRedirect, leader: s.leader}
+		result := Result{Status: Redirect, Leader: s.leader}
 		s.mu.Unlock()
 		return result
 	}
 
 	// 检查重复请求
 	if old, exists := s.requests[op.ReqID]; op.ReqID != "" && exists {
-		status := proposalApplied
+		status := Applied
 		if old.Op != op {
-			status = proposalConflict
+			status = Conflict
 		}
 		s.mu.Unlock()
-		return proposalResult{status: status}
+		return Result{Status: status, Value: old.Result}
 	}
 
 	// The lease only permits local reads; otherwise use the normal proposal.
-	if op.Action == "get" && time.Now().Before(s.readLeaseUntil) {
-		result := proposalResult{status: proposalApplied, value: s.kv[op.Key]}
+	if op.ReadOnly && time.Now().Before(s.readLeaseUntil) {
+		result := Result{Status: Applied, Value: s.machine.Read(op)}
 		s.mu.Unlock()
 		return result
 	}
 
 	proposalNumber, seq := s.leaderProposalNumber, s.max_seq+1
-	if op.Action == "get" {
-		s.pinnedReads[seq] = true
+	if !op.Noop {
+		s.pinnedResults[seq] = true
 	}
 
 	s.mu.Unlock()
@@ -124,8 +114,8 @@ func (s *Server) driveProposal(op OP) proposalResult {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 
-		if op.Action == "get" {
-			delete(s.pinnedReads, seq)
+		if !op.Noop {
+			delete(s.pinnedResults, seq)
 			if seq <= s.checkpoint.Seq {
 				delete(s.insts, seq)
 			}
@@ -140,7 +130,7 @@ func (s *Server) driveProposal(op OP) proposalResult {
 		s.mu.Unlock()
 
 		if !active {
-			return proposalResult{status: proposalRedirect, leader: leader}
+			return Result{Status: Redirect, Leader: leader}
 		}
 
 		if s.broadcastAccept(seq, proposalNumber, op) >= s.majority {
@@ -159,7 +149,7 @@ func (s *Server) driveProposal(op OP) proposalResult {
 }
 
 // Recheck heartbeat expiration after acquiring the proposal slot.
-func (s *Server) electLeader() {
+func (s *Node) electLeader() {
 	s.proposalSlot <- struct{}{}
 	defer func() { <-s.proposalSlot }()
 
@@ -218,7 +208,7 @@ func (s *Server) electLeader() {
 		}
 		s.mu.Unlock()
 
-		op := OP{Action: "nop"}
+		op := Command{Noop: true}
 		if old, exists := values[seq]; exists {
 			op = old.Value
 		}
@@ -235,63 +225,4 @@ func (s *Server) electLeader() {
 		s.lastHeartbeatTime = time.Now()
 	}
 	s.mu.Unlock()
-}
-
-func (s *Server) Set(args *ClientSetRequest, reply *ClientSetReply) error {
-	if args.ReqID == "" {
-		return fmt.Errorf("write requires ReqID")
-	}
-	ctx, cancel := handlerWaitContext(args.TimeoutMs)
-	defer cancel()
-	result := s.waitForProposal(ctx, OP{ReqID: args.ReqID, Action: "set", Key: args.Key, Value: args.Value})
-	reply.Status = result.status
-	reply.Result = result.status == proposalApplied
-	reply.LeaderAddress = s.redirectAddress(result)
-	return nil
-}
-
-func (s *Server) Get(args *ClientGetRequest, reply *ClientGetResponse) error {
-	ctx, cancel := handlerWaitContext(args.TimeoutMs)
-	defer cancel()
-	result := s.waitForProposal(ctx, OP{Action: "get", Key: args.Key})
-	reply.Status = result.status
-	reply.Result = result.status == proposalApplied
-	reply.Value = result.value
-	reply.LeaderAddress = s.redirectAddress(result)
-	return nil
-}
-
-func Serve(me int, peers []string) {
-	gob.Register("")
-
-	dataDir := os.Getenv("PAXOS_DATA_DIR")
-	if dataDir == "" {
-		dataDir = "paxos-data"
-	}
-	s, err := newServer(me, peers, dataDir)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	if err := rpc.Register(s); err != nil {
-		log.Fatal(err)
-	}
-	l, err := net.Listen("tcp", peers[me])
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Start the heartbeat ticker
-	s.StartHeartbeat()
-
-	// Start the health check ticker
-	s.StartHealthCheck()
-
-	for {
-		conn, err := l.Accept()
-		if err != nil {
-			continue
-		}
-		go rpc.ServeConn(conn)
-	}
 }

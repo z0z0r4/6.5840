@@ -7,7 +7,7 @@ import (
 	"strings"
 	"unicode"
 
-	"6.5840/paxos"
+	paxosclient "6.5840/paxos/client"
 )
 
 func main() {
@@ -24,7 +24,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	client := &paxos.Client{}
+	client := &paxosclient.Client{}
 	client.InitPeers(os.Args[1:])
 	fmt.Printf("Servers: %s\n", strings.Join(os.Args[1:], ", "))
 	printHelp()

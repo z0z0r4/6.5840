@@ -1,13 +1,10 @@
-package paxos
+package consensus
 
 import "time"
 
 const (
-	rpcTimeout           = 500 * time.Millisecond
-	serverWaitTimeout    = 10 * time.Second
-	maxPendingProposals  = 128
-	clientTimeout        = 10 * time.Second
-	clientAttemptTimeout = 2 * time.Second
+	rpcTimeout          = 500 * time.Millisecond
+	maxPendingProposals = 128
 	// Leases assume bounded clock-rate drift; the master expires before replicas.
 	followerLeaseDuration = time.Second
 	leaderLeaseDuration   = 800 * time.Millisecond

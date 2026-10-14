@@ -1,9 +1,15 @@
-package paxos
+package client
 
 import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/google/uuid"
+
+	"6.5840/paxos/api"
+	"6.5840/paxos/statemachine"
+	"6.5840/paxos/transport"
 )
 
 var ErrRequestConflict = errors.New("paxos: request ID reused with different operation")
@@ -24,19 +30,19 @@ func (c *Client) InitPeers(peers []string) {
 // SetContext bounds waiting and retries. A timeout leaves the write outcome
 // unknown; retries within this call use the same request ID.
 func (c *Client) SetContext(ctx context.Context, key, value string) error {
-	reqID := newRequestID()
-	return c.retry(ctx, func(attemptCtx context.Context, budget int64) (bool, string, proposalStatus, error) {
-		var reply ClientSetReply
-		err := callWithContext(attemptCtx, c.target_server, "Server.Set", &ClientSetRequest{ReqID: reqID, Key: key, Value: value, TimeoutMs: budget}, &reply)
+	reqID := uuid.NewString()
+	return c.retry(ctx, func(attemptCtx context.Context, budget int64) (bool, string, statemachine.Status, error) {
+		var reply api.ClientSetReply
+		err := transport.CallWithContext(attemptCtx, c.target_server, "Server.Set", &api.ClientSetRequest{ReqID: reqID, Key: key, Value: value, TimeoutMs: budget}, &reply)
 		return reply.Result, reply.LeaderAddress, reply.Status, err
 	})
 }
 
 func (c *Client) GetContext(ctx context.Context, key string) (string, error) {
 	var value string
-	err := c.retry(ctx, func(attemptCtx context.Context, budget int64) (bool, string, proposalStatus, error) {
-		var reply ClientGetResponse
-		err := callWithContext(attemptCtx, c.target_server, "Server.Get", &ClientGetRequest{Key: key, TimeoutMs: budget}, &reply)
+	err := c.retry(ctx, func(attemptCtx context.Context, budget int64) (bool, string, statemachine.Status, error) {
+		var reply api.ClientGetResponse
+		err := transport.CallWithContext(attemptCtx, c.target_server, "Server.Get", &api.ClientGetRequest{Key: key, TimeoutMs: budget}, &reply)
 		if err == nil && reply.Result {
 			value = reply.Value
 		}
@@ -45,7 +51,7 @@ func (c *Client) GetContext(ctx context.Context, key string) (string, error) {
 	return value, err
 }
 
-func (c *Client) retry(ctx context.Context, invoke func(context.Context, int64) (bool, string, proposalStatus, error)) error {
+func (c *Client) retry(ctx context.Context, invoke func(context.Context, int64) (bool, string, statemachine.Status, error)) error {
 	for attempt := 0; ; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -59,8 +65,11 @@ func (c *Client) retry(ctx context.Context, invoke func(context.Context, int64) 
 		if err == nil && ok {
 			return nil
 		}
-		if err == nil && status == proposalConflict {
+		if err == nil && status == statemachine.Conflict {
 			return ErrRequestConflict
+		}
+		if err == nil && status == statemachine.Rejected {
+			return errors.New("paxos: request rejected")
 		}
 		c.nextTarget(leader, attempt)
 		timer := time.NewTimer(retryInterval)

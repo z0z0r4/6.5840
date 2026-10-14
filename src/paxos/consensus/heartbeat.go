@@ -1,4 +1,4 @@
-package paxos
+package consensus
 
 import (
 	"time"
@@ -6,7 +6,7 @@ import (
 	"6.5840/paxos/types"
 )
 
-func (s *Server) heartbeatLocked(n types.ProposalID, leader int) bool {
+func (s *Node) heartbeatLocked(n types.ProposalID, leader int) bool {
 	if !s.validProposalNumber(n, leader) || !s.observeProposalNumberLocked(n) {
 		return false
 	}
@@ -16,7 +16,7 @@ func (s *Server) heartbeatLocked(n types.ProposalID, leader int) bool {
 	return true
 }
 
-func (s *Server) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
+func (s *Node) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -32,7 +32,7 @@ func (s *Server) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 }
 
 // Use the caller's proposal number so a delayed heartbeat cannot adopt a newer term.
-func (s *Server) broadcastHeartbeat(proposalNumber types.ProposalID) int {
+func (s *Node) broadcastHeartbeat(proposalNumber types.ProposalID) int {
 	// Start before acquiring locks or doing I/O: delayed replies never extend
 	// the master deadline beyond the replicas' protection.
 	start := time.Now()
@@ -78,7 +78,7 @@ func (s *Server) broadcastHeartbeat(proposalNumber types.ProposalID) int {
 	return count
 }
 
-func (s *Server) StartHeartbeat() {
+func (s *Node) StartHeartbeat() {
 	s.heartbeatTicker = time.NewTicker(heartbeatInterval)
 	go func() {
 		for range s.heartbeatTicker.C {

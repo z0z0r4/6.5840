@@ -1,11 +1,11 @@
-package paxos
+package consensus
 
 import (
 	"math/rand"
 	"time"
 )
 
-func (s *Server) StartHealthCheck() {
+func (s *Node) StartHealthCheck() {
 	go func() {
 		for {
 			time.Sleep(healthCheckInterval)

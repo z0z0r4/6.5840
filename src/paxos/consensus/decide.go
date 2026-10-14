@@ -1,8 +1,8 @@
-package paxos
+package consensus
 
 import "fmt"
 
-func (s *Server) decideLocked(seq int, instance Instance) (bool, error) {
+func (s *Node) decideLocked(seq int, instance Instance) (bool, error) {
 	ok, err := s.learnDecisionLocked(seq, instance)
 	if err != nil {
 		return false, err
@@ -13,7 +13,10 @@ func (s *Server) decideLocked(seq int, instance Instance) (bool, error) {
 }
 
 // Record a learned value; the caller applies and persists the complete batch.
-func (s *Server) learnDecisionLocked(seq int, instance Instance) (bool, error) {
+func (s *Node) learnDecisionLocked(seq int, instance Instance) (bool, error) {
+	if err := s.validateCommand(instance.Op); err != nil {
+		return false, err
+	}
 	if seq <= s.checkpoint.Seq {
 		return true, nil
 	}
@@ -35,7 +38,7 @@ func (s *Server) learnDecisionLocked(seq int, instance Instance) (bool, error) {
 	return true, nil
 }
 
-func (s *Server) Decide(args *DecideArgs, reply *DecideReply) error {
+func (s *Node) Decide(args *DecideArgs, reply *DecideReply) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -47,13 +50,13 @@ func (s *Server) Decide(args *DecideArgs, reply *DecideReply) error {
 	return nil
 }
 
-func (s *Server) broadcastDecide(seq int, instance Instance) int {
+func (s *Node) broadcastDecide(seq int, instance Instance) int {
 	ch := s.announceDecision(seq, instance)
 	return countQuorum(s, ch, func(r DecideReply) bool { return r.Result })
 }
 
 // Do not need to wait for a quorum of Decide replies
-func (s *Server) announceDecision(seq int, instance Instance) <-chan rpcResult[DecideReply] {
+func (s *Node) announceDecision(seq int, instance Instance) <-chan rpcResult[DecideReply] {
 	args := DecideArgs{Seq: seq, Instance: instance}
 	return fanout[DecideReply](s, "Server.Decide", &args, func(a, r any) error {
 		return s.Decide(a.(*DecideArgs), r.(*DecideReply))

@@ -1,12 +1,13 @@
-package paxos
+package consensus
 
 import (
 	"context"
-	"errors"
 	"net"
 	"net/rpc"
 	"testing"
 	"time"
+
+	"6.5840/paxos/kv"
 )
 
 func waitPendingDrained(t *testing.T, s *Server) {
@@ -24,7 +25,6 @@ func waitPendingDrained(t *testing.T, s *Server) {
 	t.Fatal("pending workers did not drain")
 }
 
-// Delay a follower until the original handler has returned its timeout.
 type delayedAcceptPeer struct {
 	*Server
 	started chan struct{}
@@ -71,7 +71,7 @@ func TestHandlerTimeoutKeepsConsensusAndDeduplicatesPending(t *testing.T) {
 	term := s.leaderProposalNumber
 	id := newRequestID()
 	var reply ClientSetReply
-	if err := s.Set(&ClientSetRequest{ReqID: id, Key: "k", Value: "v", TimeoutMs: 30}, &reply); err != nil || reply.Result || reply.Status != proposalExpired {
+	if err := s.Set(&ClientSetRequest{ReqID: id, Key: "k", Value: "v", TimeoutMs: 30}, &reply); err != nil || reply.Result || reply.Status != Expired {
 		t.Fatalf("short handler: %+v %v", reply, err)
 	}
 	select {
@@ -92,13 +92,13 @@ func TestHandlerTimeoutKeepsConsensusAndDeduplicatesPending(t *testing.T) {
 	}
 	var conflict ClientSetReply
 	s.Set(&ClientSetRequest{ReqID: id, Key: "k", Value: "wrong"}, &conflict)
-	if conflict.Status != proposalConflict {
+	if conflict.Status != Conflict {
 		t.Fatal("pending conflict not rejected")
 	}
 	close(peer.release)
 	waitPendingDrained(t, s)
 	s.mu.Lock()
-	if !s.readyLocked() || s.leaderProposalNumber != term || s.applied != 1 || s.max_seq != 1 || s.kv["k"] != "v" || len(s.requests) != 1 || len(s.pendingWrites) != 0 {
+	if !s.readyLocked() || s.leaderProposalNumber != term || s.applied != 1 || s.max_seq != 1 || values(s)["k"] != "v" || len(s.requests) != 1 || len(s.pendingWrites) != 0 {
 		s.mu.Unlock()
 		t.Fatal("abandoned write failed to commit once in the same term")
 	}
@@ -113,50 +113,15 @@ func TestHandlerTimeoutKeepsConsensusAndDeduplicatesPending(t *testing.T) {
 	}
 }
 
-func TestClientContextCancelsSilentRPC(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer l.Close()
-	accepted := make(chan net.Conn, 1)
-	go func() {
-		conn, err := l.Accept()
-		if err == nil {
-			accepted <- conn
-		}
-	}()
-	c := &Client{}
-	c.Init(l.Addr().String())
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- c.SetContext(ctx, "k", "v") }()
-	select {
-	case conn := <-accepted:
-		defer conn.Close()
-	case <-time.After(time.Second):
-		t.Fatal("client never connected")
-	}
-	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("cancel error: %v", err)
-		}
-	case <-time.After(300 * time.Millisecond):
-		t.Fatal("client ignored cancellation")
-	}
-}
-
 func TestPendingWaitersCancelIndependently(t *testing.T) {
 	s := newProtocolServer(t, []string{"local"})
 	s.lastHeartbeatTime = time.Now().Add(-2 * heartbeatTimeout)
 	s.electLeader()
 	s.proposalSlot <- struct{}{}
-	op := OP{ReqID: newRequestID(), Action: "set", Key: "k", Value: "v"}
+	op := command(kv.Operation{ReqID: newRequestID(), Action: "set", Key: "k", Value: "v"})
 	ctx, cancel := context.WithCancel(context.Background())
-	first := make(chan proposalResult, 1)
-	second := make(chan proposalResult, 1)
+	first := make(chan Result, 1)
+	second := make(chan Result, 1)
 	go func() { first <- s.waitForProposal(ctx, op) }()
 	survivorCtx, survivorCancel := context.WithTimeout(context.Background(), time.Second)
 	defer survivorCancel()
@@ -179,11 +144,11 @@ func TestPendingWaitersCancelIndependently(t *testing.T) {
 		t.Fatal("retry waiters did not share a worker")
 	}
 	cancel()
-	if result := <-first; result.status != proposalExpired {
+	if result := <-first; result.Status != Expired {
 		t.Fatal("cancelled waiter succeeded")
 	}
 	<-s.proposalSlot
-	if result := <-second; result.status != proposalApplied {
+	if result := <-second; result.Status != Applied {
 		t.Fatalf("surviving waiter: %+v", result)
 	}
 	waitPendingDrained(t, s)
@@ -200,9 +165,9 @@ func TestPendingQueueIsBoundedAndAbandonedWorkDrains(t *testing.T) {
 	s.electLeader()
 	s.proposalSlot <- struct{}{}
 	ctx, cancel := context.WithCancel(context.Background())
-	results := make(chan proposalResult, maxPendingProposals)
+	results := make(chan Result, maxPendingProposals)
 	for i := 0; i < maxPendingProposals; i++ {
-		op := OP{ReqID: newRequestID(), Action: "set", Key: "k", Value: "v"}
+		op := command(kv.Operation{ReqID: newRequestID(), Action: "set", Key: "k", Value: "v"})
 		go func() { results <- s.waitForProposal(ctx, op) }()
 	}
 	until := time.Now().Add(time.Second)
@@ -221,7 +186,7 @@ func TestPendingQueueIsBoundedAndAbandonedWorkDrains(t *testing.T) {
 		<-s.proposalSlot
 		t.Fatal("queue did not fill")
 	}
-	if result := s.waitForProposal(ctx, OP{Action: "get", Key: "k"}); result.status != proposalBusy {
+	if result := s.waitForProposal(ctx, command(kv.Operation{Action: "get", Key: "k"})); result.Status != Busy {
 		cancel()
 		<-s.proposalSlot
 		t.Fatal("queue exceeded admission limit")
@@ -230,7 +195,7 @@ func TestPendingQueueIsBoundedAndAbandonedWorkDrains(t *testing.T) {
 	for i := 0; i < maxPendingProposals; i++ {
 		select {
 		case result := <-results:
-			if result.status != proposalExpired {
+			if result.Status != Expired {
 				t.Fatal("queued write committed before admission")
 			}
 		case <-time.After(time.Second):

@@ -1,4 +1,4 @@
-package paxos
+package consensus
 
 import (
 	"time"
@@ -6,7 +6,7 @@ import (
 	"6.5840/paxos/types"
 )
 
-func (s *Server) prepareLocked(n types.ProposalID, leader int, start int) (bool, []UndecidedInstance, int, types.ProposalID) {
+func (s *Node) prepareLocked(n types.ProposalID, leader int, start int) (bool, []UndecidedInstance, int, types.ProposalID) {
 	if !s.validProposalNumber(n, leader) || !s.observeProposalNumberLocked(n) {
 		return false, nil, s.leader, s.promisedProposalNumber
 	}
@@ -20,7 +20,7 @@ func (s *Server) prepareLocked(n types.ProposalID, leader int, start int) (bool,
 	return true, values, s.leader, s.promisedProposalNumber
 }
 
-func (s *Server) Prepare(args *LeaderPrepareArgs, reply *LeaderPrepareReply) error {
+func (s *Node) Prepare(args *LeaderPrepareArgs, reply *LeaderPrepareReply) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -36,7 +36,7 @@ func (s *Server) Prepare(args *LeaderPrepareArgs, reply *LeaderPrepareReply) err
 	return nil
 }
 
-func (s *Server) broadcastPrepare(n types.ProposalID, applied int) (int, map[int]UndecidedInstance, types.ProposalID, Checkpoint) {
+func (s *Node) broadcastPrepare(n types.ProposalID, applied int) (int, map[int]UndecidedInstance, types.ProposalID, Checkpoint) {
 	args := LeaderPrepareArgs{ProposalNumber: n, LeaderID: s.own_number, StartSeq: applied}
 	ch := fanout[LeaderPrepareReply](s, "Server.Prepare", &args, func(a, r any) error {
 		return s.Prepare(a.(*LeaderPrepareArgs), r.(*LeaderPrepareReply))

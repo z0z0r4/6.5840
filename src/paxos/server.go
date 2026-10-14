@@ -10,10 +10,12 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"6.5840/paxos/types"
 )
 
 type Instance struct {
-	ProposalAcceptNumber int
+	ProposalAcceptNumber types.ProposalID
 	Op                   OP
 	Decided              bool
 	ReadValue            string
@@ -35,8 +37,8 @@ type Server struct {
 	catchingUp             bool
 	proposalSlot           chan struct{}
 	leader                 int
-	leaderProposalNumber   int
-	promisedProposalNumber int
+	leaderProposalNumber   types.ProposalID
+	promisedProposalNumber types.ProposalID
 
 	heartbeatTicker   *time.Ticker
 	lastHeartbeatTime time.Time
@@ -46,7 +48,7 @@ type Server struct {
 
 	max_seq   int
 	applied   int
-	round_num int
+	round_num uint64
 
 	mu sync.Mutex
 }

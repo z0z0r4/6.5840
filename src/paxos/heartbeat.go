@@ -1,8 +1,12 @@
 package paxos
 
-import "time"
+import (
+	"time"
 
-func (s *Server) heartbeatLocked(n int, leader int) bool {
+	"6.5840/paxos/types"
+)
+
+func (s *Server) heartbeatLocked(n types.ProposalID, leader int) bool {
 	if !s.validProposalNumber(n, leader) || !s.observeProposalNumberLocked(n) {
 		return false
 	}
@@ -28,7 +32,7 @@ func (s *Server) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 }
 
 // Use the caller's proposal number so a delayed heartbeat cannot adopt a newer term.
-func (s *Server) broadcastHeartbeat(proposalNumber int) int {
+func (s *Server) broadcastHeartbeat(proposalNumber types.ProposalID) int {
 	// Start before acquiring locks or doing I/O: delayed replies never extend
 	// the master deadline beyond the replicas' protection.
 	start := time.Now()
@@ -50,7 +54,7 @@ func (s *Server) broadcastHeartbeat(proposalNumber int) int {
 	go func() {
 		for range s.peers {
 			r := <-ch
-			if r.err == nil && r.reply.ProposalNumber > proposalNumber {
+			if r.err == nil && r.reply.ProposalNumber.Compare(proposalNumber) > 0 {
 				s.mu.Lock()
 				if s.inLeaderProposalNumberLocked(proposalNumber) {
 					s.catchupRoundNumLocked(r.reply.ProposalNumber)

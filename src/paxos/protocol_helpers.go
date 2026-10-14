@@ -4,6 +4,8 @@ import (
 	"context"
 	"log"
 	"time"
+
+	"6.5840/paxos/types"
 )
 
 type leaderPhase uint8
@@ -34,51 +36,51 @@ func (s *Server) readyLocked() bool {
 }
 
 // Recovery stops when leadership changes, independently of read lease renewal.
-func (s *Server) recoveryInterruptedLocked(proposalNumber int) bool {
+func (s *Server) recoveryInterruptedLocked(proposalNumber types.ProposalID) bool {
 	return s.phase != leaderRecovering || !s.inLeaderProposalNumberLocked(proposalNumber)
 }
 
-func (s *Server) inLeaderProposalNumberLocked(proposalNumber int) bool {
+func (s *Server) inLeaderProposalNumberLocked(proposalNumber types.ProposalID) bool {
 	return s.leader == s.own_number && s.leaderProposalNumber == proposalNumber && s.promisedProposalNumber == proposalNumber
 }
 
-func (s *Server) validProposalNumber(proposalNumber, leader int) bool {
-	return leader >= 0 && leader < len(s.peers) && proposalNumber >= 0 && proposalNumber%len(s.peers) == leader
+func (s *Server) validProposalNumber(proposalNumber types.ProposalID, leader int) bool {
+	return leader >= 0 && leader < len(s.peers) && proposalNumber.Round > 0 && proposalNumber.NodeID == uint64(leader)
 }
 
 // promiseProposalNumberLocked enforces leases and advances the global promise.
 // Accept uses this without learning the proposer's leadership identity.
-func (s *Server) promiseProposalNumberLocked(proposalNumber int) bool {
+func (s *Server) promiseProposalNumberLocked(proposalNumber types.ProposalID) bool {
 	// On restart the lease owner is unknown, so every proposal waits out the
 	// protection period. A live grant permits only its existing proposal number.
 	if proposalNumber != s.leaderProposalNumber && time.Now().Before(s.leaseGrantUntil) {
 		return false
 	}
-	if proposalNumber < s.promisedProposalNumber {
+	if proposalNumber.Compare(s.promisedProposalNumber) < 0 {
 		return false
 	}
-	if proposalNumber > s.promisedProposalNumber {
+	if proposalNumber.Compare(s.promisedProposalNumber) > 0 {
 		s.promisedProposalNumber = proposalNumber
 		s.phase = leaderFollower
 		s.readLeaseUntil = time.Time{}
 		s.leader = -1
-		s.leaderProposalNumber = -1
+		s.leaderProposalNumber = types.ProposalID{}
 		s.mustPersistLocked("promise")
 	}
 	return true
 }
 
 // Prepare and heartbeat identify the leader; Accept only establishes a promise.
-func (s *Server) observeProposalNumberLocked(proposalNumber int) bool {
+func (s *Server) observeProposalNumberLocked(proposalNumber types.ProposalID) bool {
 	if !s.promiseProposalNumberLocked(proposalNumber) {
 		return false
 	}
-	s.leader = proposalNumber % len(s.peers)
+	s.leader = int(proposalNumber.NodeID)
 	s.leaderProposalNumber = proposalNumber
 	return true
 }
 
-func (s *Server) invalidateLeaderLocked(proposalNumber int, clearLeader bool) {
+func (s *Server) invalidateLeaderLocked(proposalNumber types.ProposalID, clearLeader bool) {
 	if !s.inLeaderProposalNumberLocked(proposalNumber) {
 		return
 	}
@@ -185,9 +187,12 @@ func countQuorumContext[T any](ctx context.Context, s *Server, ch <-chan rpcResu
 	return q.yes
 }
 
-func (s *Server) catchupRoundNumLocked(proposalNumber int) {
-	if s.round_num*len(s.peers)+s.own_number < proposalNumber {
-		s.round_num = proposalNumber/len(s.peers) + 1
+func (s *Server) catchupRoundNumLocked(proposalNumber types.ProposalID) {
+	if (types.ProposalID{Round: s.round_num, NodeID: uint64(s.own_number)}).Compare(proposalNumber) <= 0 {
+		if proposalNumber.Round == ^uint64(0) {
+			panic("paxos: proposal round exhausted")
+		}
+		s.round_num = proposalNumber.Round + 1
 	}
 }
 
@@ -200,8 +205,11 @@ func (s *Server) noteSeq(seq int) {
 }
 
 // The caller must hold s.mu.
-func (s *Server) makeProposalNumberLocked() int {
+func (s *Server) makeProposalNumberLocked() types.ProposalID {
+	if s.round_num == 0 || s.round_num == ^uint64(0) {
+		panic("paxos: proposal round exhausted")
+	}
 	round := s.round_num
 	s.round_num++
-	return round*len(s.peers) + s.own_number
+	return types.ProposalID{Round: round, NodeID: uint64(s.own_number)}
 }

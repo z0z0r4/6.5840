@@ -1,15 +1,19 @@
 package paxos
 
-import "time"
+import (
+	"time"
 
-func (s *Server) prepareLocked(n int, leader int, start int) (bool, []UndecidedInstance, int, int) {
+	"6.5840/paxos/types"
+)
+
+func (s *Server) prepareLocked(n types.ProposalID, leader int, start int) (bool, []UndecidedInstance, int, types.ProposalID) {
 	if !s.validProposalNumber(n, leader) || !s.observeProposalNumberLocked(n) {
 		return false, nil, s.leader, s.promisedProposalNumber
 	}
 	s.lastHeartbeatTime = time.Now()
 	var values []UndecidedInstance
 	for seq, inst := range s.insts {
-		if seq > start && seq > s.checkpoint.Seq && inst.ProposalAcceptNumber >= 0 {
+		if seq > start && seq > s.checkpoint.Seq && inst.ProposalAcceptNumber.Round > 0 {
 			values = append(values, UndecidedInstance{Seq: seq, ProposalNumber: inst.ProposalAcceptNumber, Value: inst.Op})
 		}
 	}
@@ -32,7 +36,7 @@ func (s *Server) Prepare(args *LeaderPrepareArgs, reply *LeaderPrepareReply) err
 	return nil
 }
 
-func (s *Server) broadcastPrepare(n int, applied int) (int, map[int]UndecidedInstance, int, Checkpoint) {
+func (s *Server) broadcastPrepare(n types.ProposalID, applied int) (int, map[int]UndecidedInstance, types.ProposalID, Checkpoint) {
 	args := LeaderPrepareArgs{ProposalNumber: n, LeaderID: s.own_number, StartSeq: applied}
 	ch := fanout[LeaderPrepareReply](s, "Server.Prepare", &args, func(a, r any) error {
 		return s.Prepare(a.(*LeaderPrepareArgs), r.(*LeaderPrepareReply))
@@ -47,7 +51,7 @@ func (s *Server) broadcastPrepare(n int, applied int) (int, map[int]UndecidedIns
 		if r.err != nil {
 			continue
 		}
-		if r.reply.ProposalNumber > highest {
+		if r.reply.ProposalNumber.Compare(highest) > 0 {
 			highest = r.reply.ProposalNumber
 		}
 		if !r.reply.Prepared {
@@ -58,7 +62,7 @@ func (s *Server) broadcastPrepare(n int, applied int) (int, map[int]UndecidedIns
 		}
 		for _, inst := range r.reply.UndecidedInstances {
 			old, exists := values[inst.Seq]
-			if !exists || inst.ProposalNumber > old.ProposalNumber {
+			if !exists || inst.ProposalNumber.Compare(old.ProposalNumber) > 0 {
 				values[inst.Seq] = inst
 			}
 		}

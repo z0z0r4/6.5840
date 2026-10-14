@@ -5,6 +5,8 @@ import (
 	"net"
 	"net/rpc"
 	"time"
+
+	"6.5840/paxos/types"
 )
 
 type OP struct {
@@ -42,14 +44,14 @@ type ClientGetResponse struct {
 
 type LeaderPrepareArgs struct {
 	Seq            int
-	ProposalNumber int
+	ProposalNumber types.ProposalID
 	LeaderID       int
 	StartSeq       int
 }
 
 type UndecidedInstance struct {
 	Seq            int
-	ProposalNumber int
+	ProposalNumber types.ProposalID
 	Value          OP
 }
 
@@ -59,7 +61,7 @@ type LeaderPrepareReply struct {
 	Prepared   bool
 
 	// The following fields are only valid if Prepared is false
-	ProposalNumber int
+	ProposalNumber types.ProposalID
 
 	// The following field is only valid if Prepared is true
 	UndecidedInstances []UndecidedInstance
@@ -67,7 +69,7 @@ type LeaderPrepareReply struct {
 
 type AcceptArgs struct {
 	Seq            int
-	ProposalNumber int
+	ProposalNumber types.ProposalID
 	Value          OP
 }
 
@@ -87,12 +89,12 @@ type DecideReply struct {
 
 type HeartbeatArgs struct {
 	LeaderID       int
-	ProposalNumber int
+	ProposalNumber types.ProposalID
 	Applied        int
 }
 
 type FetchLogArgs struct {
-	ProposalNumber int
+	ProposalNumber types.ProposalID
 	StartSeq       int
 }
 
@@ -109,7 +111,7 @@ type FetchLogReply struct {
 
 type HeartbeatReply struct {
 	Result         bool
-	ProposalNumber int
+	ProposalNumber types.ProposalID
 }
 
 func call(peer, method string, args any, reply any) error {

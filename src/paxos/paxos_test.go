@@ -22,16 +22,19 @@ import (
 	"time"
 
 	"github.com/anishathalye/porcupine"
+
+	"6.5840/paxos/types"
 )
 
 // Probe is registered only by the test subprocess, never by Serve.
 type NodeState struct {
-	Checkpoint                                  Checkpoint
-	ID, Applied, MaxSeq, Leader, ProposalNumber int
-	Ready                                       bool
-	KV                                          map[string]string
-	Requests                                    map[string]RequestRecord
-	Insts                                       map[int]Instance
+	Checkpoint                  Checkpoint
+	ID, Applied, MaxSeq, Leader int
+	ProposalNumber              types.ProposalID
+	Ready                       bool
+	KV                          map[string]string
+	Requests                    map[string]RequestRecord
+	Insts                       map[int]Instance
 }
 
 type StateProbe struct{ s *Server }
@@ -262,8 +265,8 @@ func (c *testCluster) validate(s NodeState) error {
 	if c.observed == nil {
 		c.observed = make(map[int]NodeState)
 	}
-	if old, ok := c.observed[s.ID]; ok && (s.Applied < old.Applied || s.MaxSeq < old.MaxSeq || s.ProposalNumber < old.ProposalNumber) {
-		return fmt.Errorf("node %d durable counters regressed: applied %d->%d max %d->%d proposal number %d->%d", s.ID, old.Applied, s.Applied, old.MaxSeq, s.MaxSeq, old.ProposalNumber, s.ProposalNumber)
+	if old, ok := c.observed[s.ID]; ok && (s.Applied < old.Applied || s.MaxSeq < old.MaxSeq || s.ProposalNumber.Compare(old.ProposalNumber) < 0) {
+		return fmt.Errorf("node %d durable counters regressed: applied %d->%d max %d->%d proposal number %v->%v", s.ID, old.Applied, s.Applied, old.MaxSeq, s.MaxSeq, old.ProposalNumber, s.ProposalNumber)
 	}
 	c.observed[s.ID] = s
 	if s.Ready && s.Leader != s.ID {
@@ -307,7 +310,7 @@ func (c *testCluster) validate(s NodeState) error {
 		return fmt.Errorf("node %d KV differs from log replay: got=%v replay=%v", s.ID, s.KV, kv)
 	}
 	for seq, inst := range s.Insts {
-		if seq < 1 || seq > s.MaxSeq || (!inst.Decided && inst.ProposalAcceptNumber > s.ProposalNumber) {
+		if seq < 1 || seq > s.MaxSeq || (!inst.Decided && inst.ProposalAcceptNumber.Compare(s.ProposalNumber) > 0) {
 			return fmt.Errorf("node %d invalid slot %d: %+v", s.ID, seq, inst)
 		}
 		if inst.Decided {
@@ -608,12 +611,12 @@ func newProtocolServer(t *testing.T, peers []string) *Server {
 func TestGlobalPromiseProtectsEveryInstance(t *testing.T) {
 	s := newProtocolServer(t, []string{"p0", "p1", "p2"})
 	var first AcceptReply
-	s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: 4, Value: OP{Action: "nop"}}, &first)
+	s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: types.ProposalID{Round: 2, NodeID: 1}, Value: OP{Action: "nop"}}, &first)
 	if !first.Accepted {
 		t.Fatal("initial Accept rejected")
 	}
 	var prepare LeaderPrepareReply
-	s.Prepare(&LeaderPrepareArgs{ProposalNumber: 8, LeaderID: 2}, &prepare)
+	s.Prepare(&LeaderPrepareArgs{ProposalNumber: types.ProposalID{Round: 3, NodeID: 2}, LeaderID: 2}, &prepare)
 	if !prepare.Prepared {
 		t.Fatal("higher global promise rejected")
 	}
@@ -624,12 +627,12 @@ func TestGlobalPromiseProtectsEveryInstance(t *testing.T) {
 	for _, node := range []*Server{s, restarted} {
 		for _, seq := range []int{1, 2} {
 			var reply AcceptReply
-			node.Accept(&AcceptArgs{Seq: seq, ProposalNumber: 4, Value: OP{Action: "nop"}}, &reply)
+			node.Accept(&AcceptArgs{Seq: seq, ProposalNumber: types.ProposalID{Round: 2, NodeID: 1}, Value: OP{Action: "nop"}}, &reply)
 			if reply.Accepted {
 				t.Fatalf("old proposal accepted in slot %d despite global promise", seq)
 			}
 		}
-		if node.insts[1].ProposalAcceptNumber != 4 {
+		if node.insts[1].ProposalAcceptNumber != (types.ProposalID{Round: 2, NodeID: 1}) {
 			t.Fatal("global Prepare overwrote the instance's accepted number")
 		}
 	}
@@ -639,14 +642,14 @@ func TestLearnedDecisionDoesNotEstablishPromise(t *testing.T) {
 	s := newProtocolServer(t, []string{"p0", "p1", "p2"})
 	op := OP{Action: "set", Key: "k", Value: "chosen"}
 	var decided DecideReply
-	if err := s.Decide(&DecideArgs{Seq: 1, Instance: Instance{ProposalAcceptNumber: 8, Op: op, Decided: true}}, &decided); err != nil || !decided.Result {
+	if err := s.Decide(&DecideArgs{Seq: 1, Instance: Instance{ProposalAcceptNumber: types.ProposalID{Round: 3, NodeID: 2}, Op: op, Decided: true}}, &decided); err != nil || !decided.Result {
 		t.Fatalf("learn decision: %+v %v", decided, err)
 	}
-	if s.promisedProposalNumber != -1 || s.insts[1].ProposalAcceptNumber != 8 || s.kv["k"] != "chosen" {
+	if s.promisedProposalNumber != (types.ProposalID{}) || s.insts[1].ProposalAcceptNumber != (types.ProposalID{Round: 3, NodeID: 2}) || s.kv["k"] != "chosen" {
 		t.Fatal("learning a decision changed the promise or lost the value")
 	}
 	var accepted AcceptReply
-	s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: 10, Value: OP{Action: "set", Key: "k", Value: "conflict"}}, &accepted)
+	s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: types.ProposalID{Round: 4, NodeID: 1}, Value: OP{Action: "set", Key: "k", Value: "conflict"}}, &accepted)
 	if accepted.Accepted || s.insts[1].Op != op {
 		t.Fatal("removing the instance promise allowed a conflicting decided value")
 	}
@@ -655,7 +658,7 @@ func TestLearnedDecisionDoesNotEstablishPromise(t *testing.T) {
 func decideOperation(t *testing.T, s *Server, seq int, op OP) {
 	t.Helper()
 	var reply DecideReply
-	if err := s.Decide(&DecideArgs{Seq: seq, Instance: Instance{ProposalAcceptNumber: 0, Op: op, Decided: true}}, &reply); err != nil || !reply.Result {
+	if err := s.Decide(&DecideArgs{Seq: seq, Instance: Instance{ProposalAcceptNumber: types.ProposalID{Round: 1, NodeID: 0}, Op: op, Decided: true}}, &reply); err != nil || !reply.Result {
 		t.Fatalf("decide slot %d: reply=%+v err=%v", seq, reply, err)
 	}
 }
@@ -667,7 +670,7 @@ func TestBroadcastCompletesLocalTransition(t *testing.T) {
 	done := make(chan (<-chan rpcResult[AcceptReply]), 1)
 	started := make(chan struct{})
 	go func() {
-		args := AcceptArgs{Seq: 1, ProposalNumber: 0, Value: OP{Action: "nop"}}
+		args := AcceptArgs{Seq: 1, ProposalNumber: types.ProposalID{Round: 1, NodeID: 0}, Value: OP{Action: "nop"}}
 		ch := fanout[AcceptReply](s, "Server.Accept", &args, func(a, r any) error {
 			close(started)
 			return s.Accept(a.(*AcceptArgs), r.(*AcceptReply))
@@ -744,7 +747,7 @@ func TestGetAtCompactionBoundary(t *testing.T) {
 		t.Fatalf("write did not compact state: checkpoint=%d entries=%d", s.checkpoint.Seq, len(s.insts))
 	}
 	var accepted AcceptReply
-	s.Accept(&AcceptArgs{Seq: logRetention, ProposalNumber: 0, Value: OP{Action: "set", Key: "k", Value: "bad"}}, &accepted)
+	s.Accept(&AcceptArgs{Seq: logRetention, ProposalNumber: types.ProposalID{Round: 1, NodeID: 0}, Value: OP{Action: "set", Key: "k", Value: "bad"}}, &accepted)
 	if accepted.Accepted {
 		t.Fatal("compacted read slot was accepted again")
 	}
@@ -757,28 +760,28 @@ func TestGetAtCompactionBoundary(t *testing.T) {
 func TestRejectedProposalNumbersDoNotChangePromise(t *testing.T) {
 	s := newProtocolServer(t, []string{"p0", "p1", "p2"})
 	var prepared LeaderPrepareReply
-	s.Prepare(&LeaderPrepareArgs{ProposalNumber: 4, LeaderID: 1}, &prepared)
+	s.Prepare(&LeaderPrepareArgs{ProposalNumber: types.ProposalID{Round: 2, NodeID: 1}, LeaderID: 1}, &prepared)
 	for _, args := range []LeaderPrepareArgs{
-		{ProposalNumber: 1, LeaderID: 1},
-		{ProposalNumber: 4, LeaderID: 2},
-		{ProposalNumber: 7, LeaderID: 2},
-		{ProposalNumber: -1, LeaderID: 0},
-		{ProposalNumber: 6, LeaderID: 3},
+		{ProposalNumber: types.ProposalID{Round: 1, NodeID: 1}, LeaderID: 1},
+		{ProposalNumber: types.ProposalID{Round: 2, NodeID: 1}, LeaderID: 2},
+		{ProposalNumber: types.ProposalID{Round: 3, NodeID: 1}, LeaderID: 2},
+		{ProposalNumber: types.ProposalID{}, LeaderID: 0},
+		{ProposalNumber: types.ProposalID{Round: 3, NodeID: 0}, LeaderID: 3},
 	} {
 		var prepare LeaderPrepareReply
 		var heartbeat HeartbeatReply
 		s.Prepare(&args, &prepare)
 		s.Heartbeat(&HeartbeatArgs{ProposalNumber: args.ProposalNumber, LeaderID: args.LeaderID}, &heartbeat)
-		if prepare.Prepared || heartbeat.Result || s.promisedProposalNumber != 4 || s.leaderProposalNumber != 4 || s.leader != 1 {
+		if prepare.Prepared || heartbeat.Result || s.promisedProposalNumber != (types.ProposalID{Round: 2, NodeID: 1}) || s.leaderProposalNumber != (types.ProposalID{Round: 2, NodeID: 1}) || s.leader != 1 {
 			t.Fatalf("invalid proposal number changed leadership: args=%+v prepare=%+v heartbeat=%+v", args, prepare, heartbeat)
 		}
 	}
 	var accept AcceptReply
-	s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: 1, Value: OP{Action: "nop"}}, &accept)
+	s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: types.ProposalID{Round: 1, NodeID: 1}, Value: OP{Action: "nop"}}, &accept)
 	if accept.Accepted || len(s.insts) != 0 {
 		t.Fatal("stale Accept created an instance")
 	}
-	for _, args := range []FetchLogArgs{{ProposalNumber: 1, StartSeq: 1}, {ProposalNumber: 4, StartSeq: 0}} {
+	for _, args := range []FetchLogArgs{{ProposalNumber: types.ProposalID{Round: 1, NodeID: 1}, StartSeq: 1}, {ProposalNumber: types.ProposalID{Round: 2, NodeID: 1}, StartSeq: 0}} {
 		var reply FetchLogReply
 		s.FetchLog(&args, &reply)
 		if reply.Result || len(reply.Entries) != 0 {
@@ -810,12 +813,12 @@ func TestDecidedConflictDoesNotMutateState(t *testing.T) {
 	decideOperation(t, s, 1, op)
 	before := s.insts[1]
 	var reply DecideReply
-	err := s.Decide(&DecideArgs{Seq: 1, Instance: Instance{ProposalAcceptNumber: 10, Op: OP{Action: "set", Key: "k", Value: "conflict"}, Decided: true}}, &reply)
+	err := s.Decide(&DecideArgs{Seq: 1, Instance: Instance{ProposalAcceptNumber: types.ProposalID{Round: 11, NodeID: 0}, Op: OP{Action: "set", Key: "k", Value: "conflict"}, Decided: true}}, &reply)
 	if err == nil || reply.Result || s.insts[1] != before || s.kv["k"] != "chosen" {
 		t.Fatal("conflicting Decide changed a chosen operation")
 	}
 	var accepted AcceptReply
-	s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: 10, Value: OP{Action: "nop"}}, &accepted)
+	s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: types.ProposalID{Round: 11, NodeID: 0}, Value: OP{Action: "nop"}}, &accepted)
 	if accepted.Accepted || s.insts[1] != before {
 		t.Fatal("conflicting Accept changed a decided slot")
 	}
@@ -907,7 +910,7 @@ func TestHigherProposalNumberInvalidatesLeader(t *testing.T) {
 				t.Fatal(err)
 			}
 			s.mu.Lock()
-			s.observeProposalNumberLocked(0)
+			s.observeProposalNumberLocked(types.ProposalID{Round: 1, NodeID: 0})
 			s.phase = leaderReady
 			if !s.readyLocked() {
 				t.Fatal("initial leader is not ready")
@@ -917,33 +920,33 @@ func TestHigherProposalNumberInvalidatesLeader(t *testing.T) {
 			switch source {
 			case "prepare":
 				var reply LeaderPrepareReply
-				s.Prepare(&LeaderPrepareArgs{ProposalNumber: 4, LeaderID: 1}, &reply)
+				s.Prepare(&LeaderPrepareArgs{ProposalNumber: types.ProposalID{Round: 2, NodeID: 1}, LeaderID: 1}, &reply)
 				if !reply.Prepared {
 					t.Fatal("higher prepare rejected")
 				}
 			case "accept":
 				var reply AcceptReply
-				s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: 4, Value: OP{Action: "nop"}}, &reply)
+				s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: types.ProposalID{Round: 2, NodeID: 1}, Value: OP{Action: "nop"}}, &reply)
 				if !reply.Accepted {
 					t.Fatal("higher accept rejected")
 				}
 			case "heartbeat":
 				var reply HeartbeatReply
-				s.Heartbeat(&HeartbeatArgs{ProposalNumber: 4, LeaderID: 1}, &reply)
+				s.Heartbeat(&HeartbeatArgs{ProposalNumber: types.ProposalID{Round: 2, NodeID: 1}, LeaderID: 1}, &reply)
 				if !reply.Result {
 					t.Fatal("higher heartbeat rejected")
 				}
 			}
-			leader, leaderProposalNumber := 1, 4
+			leader, leaderProposalNumber := 1, types.ProposalID{Round: 2, NodeID: 1}
 			if source == "accept" {
-				leader, leaderProposalNumber = -1, -1
+				leader, leaderProposalNumber = -1, types.ProposalID{}
 			}
 			s.mu.Lock()
-			if s.readyLocked() || s.phase != leaderFollower || s.leader != leader || s.leaderProposalNumber != leaderProposalNumber || s.promisedProposalNumber != 4 {
+			if s.readyLocked() || s.phase != leaderFollower || s.leader != leader || s.leaderProposalNumber != leaderProposalNumber || s.promisedProposalNumber != (types.ProposalID{Round: 2, NodeID: 1}) {
 				t.Fatal("higher proposal number did not invalidate the old leadership correctly")
 			}
 			// A delayed failure from the old term must not invalidate the new one.
-			s.invalidateLeaderLocked(0, true)
+			s.invalidateLeaderLocked(types.ProposalID{Round: 1, NodeID: 0}, true)
 			if s.leader != leader {
 				t.Fatal("old-term failure changed the leadership")
 			}
@@ -956,7 +959,7 @@ func TestHigherProposalNumberInvalidatesLeader(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if s.promisedProposalNumber != 4 || s.readyLocked() {
+			if s.promisedProposalNumber != (types.ProposalID{Round: 2, NodeID: 1}) || s.readyLocked() {
 				t.Fatal("restart lost promise or restored ready leadership")
 			}
 		})
@@ -974,12 +977,12 @@ func TestLeaderPromiseSurvivesRestart(t *testing.T) {
 			}
 			if source == "prepare" {
 				var reply LeaderPrepareReply
-				if err := s.Prepare(&LeaderPrepareArgs{ProposalNumber: 21, LeaderID: 1}, &reply); err != nil || !reply.Prepared {
+				if err := s.Prepare(&LeaderPrepareArgs{ProposalNumber: types.ProposalID{Round: 5, NodeID: 1}, LeaderID: 1}, &reply); err != nil || !reply.Prepared {
 					t.Fatalf("prepare: %+v %v", reply, err)
 				}
 			} else {
 				var reply HeartbeatReply
-				if err := s.Heartbeat(&HeartbeatArgs{ProposalNumber: 21, LeaderID: 1}, &reply); err != nil || !reply.Result {
+				if err := s.Heartbeat(&HeartbeatArgs{ProposalNumber: types.ProposalID{Round: 5, NodeID: 1}, LeaderID: 1}, &reply); err != nil || !reply.Result {
 					t.Fatalf("heartbeat: %+v %v", reply, err)
 				}
 			}
@@ -988,12 +991,12 @@ func TestLeaderPromiseSurvivesRestart(t *testing.T) {
 				t.Fatal(err)
 			}
 			var accept AcceptReply
-			s.Accept(&AcceptArgs{Seq: 100, ProposalNumber: 16, Value: OP{Action: "nop"}}, &accept)
+			s.Accept(&AcceptArgs{Seq: 100, ProposalNumber: types.ProposalID{Round: 4, NodeID: 1}, Value: OP{Action: "nop"}}, &accept)
 			if accept.Accepted {
 				t.Fatal("old leader accepted in a fresh slot after restart")
 			}
 			var heartbeat HeartbeatReply
-			s.Heartbeat(&HeartbeatArgs{LeaderID: 1, ProposalNumber: 16}, &heartbeat)
+			s.Heartbeat(&HeartbeatArgs{LeaderID: 1, ProposalNumber: types.ProposalID{Round: 4, NodeID: 1}}, &heartbeat)
 			if heartbeat.Result {
 				t.Fatal("stale heartbeat accepted")
 			}
@@ -1007,8 +1010,8 @@ func TestSameProposalNumberCannotAcceptDifferentValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	var first, second AcceptReply
-	s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: 10, Value: OP{Action: "set", Key: "k", Value: "first"}}, &first)
-	s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: 10, Value: OP{Action: "set", Key: "k", Value: "second"}}, &second)
+	s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: types.ProposalID{Round: 11, NodeID: 0}, Value: OP{Action: "set", Key: "k", Value: "first"}}, &first)
+	s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: types.ProposalID{Round: 11, NodeID: 0}, Value: OP{Action: "set", Key: "k", Value: "second"}}, &second)
 	if !first.Accepted || second.Accepted {
 		t.Fatalf("same proposal number conflicting values: first=%v second=%v", first.Accepted, second.Accepted)
 	}
@@ -1037,7 +1040,7 @@ func TestCompactedPrepareRecovery(t *testing.T) {
 		if i != 0 {
 			for seq := 1; seq <= logRetention+3; seq++ {
 				var reply DecideReply
-				err := s.Decide(&DecideArgs{Seq: seq, Instance: Instance{ProposalAcceptNumber: 0, Op: OP{Action: "set", Key: "k", Value: fmt.Sprint(seq)}, Decided: true}}, &reply)
+				err := s.Decide(&DecideArgs{Seq: seq, Instance: Instance{ProposalAcceptNumber: types.ProposalID{Round: 1, NodeID: 0}, Op: OP{Action: "set", Key: "k", Value: fmt.Sprint(seq)}, Decided: true}}, &reply)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -1080,7 +1083,7 @@ func TestDecidedDuplicateRequestSurvivesRestart(t *testing.T) {
 	// Duplicates can occur in different slots after retry or leader recovery.
 	for _, seq := range []int{2, 1} {
 		var reply DecideReply
-		if err := s.Decide(&DecideArgs{Seq: seq, Instance: Instance{ProposalAcceptNumber: 0, Op: op, Decided: true}}, &reply); err != nil {
+		if err := s.Decide(&DecideArgs{Seq: seq, Instance: Instance{ProposalAcceptNumber: types.ProposalID{Round: 1, NodeID: 0}, Op: op, Decided: true}}, &reply); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1089,9 +1092,9 @@ func TestDecidedDuplicateRequestSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	var newer DecideReply
-	s.Decide(&DecideArgs{Seq: 3, Instance: Instance{ProposalAcceptNumber: 0, Op: OP{ReqID: newRequestID(), Action: "set", Key: "k", Value: "newer"}, Decided: true}}, &newer)
+	s.Decide(&DecideArgs{Seq: 3, Instance: Instance{ProposalAcceptNumber: types.ProposalID{Round: 1, NodeID: 0}, Op: OP{ReqID: newRequestID(), Action: "set", Key: "k", Value: "newer"}, Decided: true}}, &newer)
 	var reply DecideReply
-	s.Decide(&DecideArgs{Seq: 4, Instance: Instance{ProposalAcceptNumber: 0, Op: op, Decided: true}}, &reply)
+	s.Decide(&DecideArgs{Seq: 4, Instance: Instance{ProposalAcceptNumber: types.ProposalID{Round: 1, NodeID: 0}, Op: op, Decided: true}}, &reply)
 	if s.kv["k"] != "newer" || s.applied != 4 || s.requests[op.ReqID].Seq != 1 {
 		t.Fatalf("duplicate application: kv=%v applied=%d requests=%v", s.kv, s.applied, s.requests)
 	}
@@ -1120,7 +1123,7 @@ func TestFiveNodeRecovery(t *testing.T) {
 	c.converge(want)
 	after := c.leader()
 	if before.ID != after.ID || before.ProposalNumber != after.ProposalNumber {
-		t.Fatalf("follower restart triggered election: before leader=%d proposalNumber=%d, after leader=%d proposal number=%d", before.ID, before.ProposalNumber, after.ID, after.ProposalNumber)
+		t.Fatalf("follower restart triggered election: before leader=%d proposalNumber=%v, after leader=%d proposal number=%v", before.ID, before.ProposalNumber, after.ID, after.ProposalNumber)
 	}
 	c.stop(after.ID)
 	c.set("failover", "ok")
@@ -1131,7 +1134,7 @@ func TestFiveNodeRecovery(t *testing.T) {
 	c.converge(want)
 	restored := c.leader()
 	if replacement.ID != restored.ID || replacement.ProposalNumber != restored.ProposalNumber {
-		t.Fatalf("node that missed Prepare triggered election: before leader=%d proposalNumber=%d, after leader=%d proposal number=%d", replacement.ID, replacement.ProposalNumber, restored.ID, restored.ProposalNumber)
+		t.Fatalf("node that missed Prepare triggered election: before leader=%d proposalNumber=%v, after leader=%d proposal number=%v", replacement.ID, replacement.ProposalNumber, restored.ID, restored.ProposalNumber)
 	}
 	for i := range c.procs {
 		c.stop(i)
@@ -1661,7 +1664,7 @@ func TestAcceptQuorumHonorsRequestDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	if votes := s.broadcastAcceptContext(ctx, 1, 0, OP{Action: "nop"}); votes >= s.majority {
+	if votes := s.broadcastAcceptContext(ctx, 1, types.ProposalID{Round: 1, NodeID: 0}, OP{Action: "nop"}); votes >= s.majority {
 		t.Fatal("silent peer formed a majority")
 	}
 	if time.Since(start) > 300*time.Millisecond {
@@ -1682,14 +1685,14 @@ func TestQueuedElectionRechecksHeartbeat(t *testing.T) {
 	done := make(chan struct{})
 	go func() { s.electLeader(); close(done) }()
 	var reply HeartbeatReply
-	s.Heartbeat(&HeartbeatArgs{LeaderID: 1, ProposalNumber: 4}, &reply)
+	s.Heartbeat(&HeartbeatArgs{LeaderID: 1, ProposalNumber: types.ProposalID{Round: 2, NodeID: 1}}, &reply)
 	<-s.proposalSlot
 	select {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("queued election did not finish")
 	}
-	if s.promisedProposalNumber != 4 || s.leader != 1 || s.round_num != 0 {
+	if s.promisedProposalNumber != (types.ProposalID{Round: 2, NodeID: 1}) || s.leader != 1 || s.round_num != 1 {
 		t.Fatal("fresh heartbeat was ignored after queueing")
 	}
 }
@@ -1744,7 +1747,7 @@ func TestHeartbeatLeaseProtectsProposalNumber(t *testing.T) {
 		t.Run(source, func(t *testing.T) {
 			s := newProtocolServer(t, []string{"p0", "p1", "p2"})
 			var granted HeartbeatReply
-			s.Heartbeat(&HeartbeatArgs{LeaderID: 1, ProposalNumber: 4}, &granted)
+			s.Heartbeat(&HeartbeatArgs{LeaderID: 1, ProposalNumber: types.ProposalID{Round: 2, NodeID: 1}}, &granted)
 			if !granted.Result {
 				t.Fatal("initial lease rejected")
 			}
@@ -1752,30 +1755,30 @@ func TestHeartbeatLeaseProtectsProposalNumber(t *testing.T) {
 				switch source {
 				case "prepare":
 					var r LeaderPrepareReply
-					s.Prepare(&LeaderPrepareArgs{LeaderID: 2, ProposalNumber: 8}, &r)
+					s.Prepare(&LeaderPrepareArgs{LeaderID: 2, ProposalNumber: types.ProposalID{Round: 3, NodeID: 2}}, &r)
 					return r.Prepared
 				case "accept":
 					var r AcceptReply
-					s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: 8, Value: OP{Action: "nop"}}, &r)
+					s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: types.ProposalID{Round: 3, NodeID: 2}, Value: OP{Action: "nop"}}, &r)
 					return r.Accepted
 				default:
 					var r HeartbeatReply
-					s.Heartbeat(&HeartbeatArgs{LeaderID: 2, ProposalNumber: 8}, &r)
+					s.Heartbeat(&HeartbeatArgs{LeaderID: 2, ProposalNumber: types.ProposalID{Round: 3, NodeID: 2}}, &r)
 					return r.Result
 				}
 			}
 			until := s.leaseGrantUntil
-			if attempt() || s.promisedProposalNumber != 4 || s.leaseGrantUntil != until || s.max_seq != 0 {
+			if attempt() || s.promisedProposalNumber != (types.ProposalID{Round: 2, NodeID: 1}) || s.leaseGrantUntil != until || s.max_seq != 0 {
 				t.Fatal("another proposal bypassed or mutated the live lease")
 			}
 			// Same-term traffic is allowed while other proposals are excluded.
 			var accepted AcceptReply
-			s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: 4, Value: OP{Action: "nop"}}, &accepted)
+			s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: types.ProposalID{Round: 2, NodeID: 1}, Value: OP{Action: "nop"}}, &accepted)
 			if !accepted.Accepted {
 				t.Fatal("lease blocked its owner")
 			}
 			s.leaseGrantUntil = time.Now().Add(-time.Second)
-			if !attempt() || s.promisedProposalNumber != 8 {
+			if !attempt() || s.promisedProposalNumber != (types.ProposalID{Round: 3, NodeID: 2}) {
 				t.Fatal("expired lease prevented takeover")
 			}
 		})
@@ -1844,21 +1847,21 @@ func TestPeriodicHeartbeatRenewsLocalReads(t *testing.T) {
 func TestLeaseRestartProtection(t *testing.T) {
 	s := newProtocolServer(t, []string{"p0", "p1", "p2"})
 	var granted HeartbeatReply
-	s.Heartbeat(&HeartbeatArgs{LeaderID: 1, ProposalNumber: 4}, &granted)
+	s.Heartbeat(&HeartbeatArgs{LeaderID: 1, ProposalNumber: types.ProposalID{Round: 2, NodeID: 1}}, &granted)
 	restarted, err := newServer(0, s.peers, tDir(s))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, n := range []int{4, 8} {
+	for _, n := range []types.ProposalID{{Round: 2, NodeID: 1}, {Round: 3, NodeID: 2}} {
 		var r HeartbeatReply
-		restarted.Heartbeat(&HeartbeatArgs{LeaderID: n % 3, ProposalNumber: n}, &r)
-		if r.Result || restarted.promisedProposalNumber != 4 || !restarted.readLeaseUntil.IsZero() {
+		restarted.Heartbeat(&HeartbeatArgs{LeaderID: int(n.NodeID), ProposalNumber: n}, &r)
+		if r.Result || restarted.promisedProposalNumber != (types.ProposalID{Round: 2, NodeID: 1}) || !restarted.readLeaseUntil.IsZero() {
 			t.Fatal("restart forgot lease protection or restored a read lease")
 		}
 	}
 	restarted.leaseGrantUntil = time.Now().Add(-time.Second)
 	var prepared LeaderPrepareReply
-	restarted.Prepare(&LeaderPrepareArgs{LeaderID: 2, ProposalNumber: 8}, &prepared)
+	restarted.Prepare(&LeaderPrepareArgs{LeaderID: 2, ProposalNumber: types.ProposalID{Round: 3, NodeID: 2}}, &prepared)
 	if !prepared.Prepared {
 		t.Fatal("restart protection never allowed a new leader")
 	}
@@ -1866,9 +1869,9 @@ func TestLeaseRestartProtection(t *testing.T) {
 
 func TestHeartbeatWithoutQuorumDoesNotGrantReadLease(t *testing.T) {
 	s := newProtocolServer(t, []string{"p0", "127.0.0.1:0", "127.0.0.1:0"})
-	s.observeProposalNumberLocked(0)
+	s.observeProposalNumberLocked(types.ProposalID{Round: 1, NodeID: 0})
 	s.phase = leaderReady
-	if s.broadcastHeartbeat(0) >= s.majority || !s.readLeaseUntil.IsZero() {
+	if s.broadcastHeartbeat(types.ProposalID{Round: 1, NodeID: 0}) >= s.majority || !s.readLeaseUntil.IsZero() {
 		t.Fatal("local heartbeat alone established a master lease")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -2038,15 +2041,15 @@ func TestHeartbeatLateHigherPromiseStopsRenewal(t *testing.T) {
 		}()
 	}
 	s := newProtocolServer(t, peers)
-	s.observeProposalNumberLocked(0)
+	s.observeProposalNumberLocked(types.ProposalID{Round: 1, NodeID: 0})
 	s.phase = leaderReady
-	if s.broadcastHeartbeat(0) != s.majority {
+	if s.broadcastHeartbeat(types.ProposalID{Round: 1, NodeID: 0}) != s.majority {
 		t.Fatal("initial majority heartbeat failed")
 	}
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		s.mu.Lock()
-		stopped := s.phase == leaderFollower && s.readLeaseUntil.IsZero() && s.round_num >= 3
+		stopped := s.phase == leaderFollower && s.readLeaseUntil.IsZero() && s.round_num >= 4
 		s.mu.Unlock()
 		if stopped {
 			return
@@ -2061,7 +2064,7 @@ type leaseHeartbeatPeer struct{ higher bool }
 func (p *leaseHeartbeatPeer) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 	if p.higher {
 		time.Sleep(50 * time.Millisecond)
-		reply.ProposalNumber = 8
+		reply.ProposalNumber = types.ProposalID{Round: 3, NodeID: 2}
 	} else {
 		reply.Result = true
 		reply.ProposalNumber = args.ProposalNumber
@@ -2075,32 +2078,81 @@ func TestAcceptDoesNotLearnLeader(t *testing.T) {
 			s := newProtocolServer(t, []string{"p0", "p1", "p2"})
 			for seq := 1; seq <= 2; seq++ {
 				var reply AcceptReply
-				s.Accept(&AcceptArgs{Seq: seq, ProposalNumber: 4, Value: OP{Action: "nop"}}, &reply)
-				if !reply.Accepted || s.promisedProposalNumber != 4 || s.leader != -1 || s.leaderProposalNumber != -1 || s.readyLocked() {
+				s.Accept(&AcceptArgs{Seq: seq, ProposalNumber: types.ProposalID{Round: 2, NodeID: 1}, Value: OP{Action: "nop"}}, &reply)
+				if !reply.Accepted || s.promisedProposalNumber != (types.ProposalID{Round: 2, NodeID: 1}) || s.leader != -1 || s.leaderProposalNumber != (types.ProposalID{}) || s.readyLocked() {
 					t.Fatal("Accept learned leadership instead of only updating the promise")
 				}
 			}
 			if source == "prepare" {
 				var reply LeaderPrepareReply
-				s.Prepare(&LeaderPrepareArgs{ProposalNumber: 4, LeaderID: 1}, &reply)
+				s.Prepare(&LeaderPrepareArgs{ProposalNumber: types.ProposalID{Round: 2, NodeID: 1}, LeaderID: 1}, &reply)
 				if !reply.Prepared {
 					t.Fatal("same-promise Prepare was rejected")
 				}
 			} else {
 				var reply HeartbeatReply
-				s.Heartbeat(&HeartbeatArgs{ProposalNumber: 4, LeaderID: 1}, &reply)
+				s.Heartbeat(&HeartbeatArgs{ProposalNumber: types.ProposalID{Round: 2, NodeID: 1}, LeaderID: 1}, &reply)
 				if !reply.Result {
 					t.Fatal("same-promise heartbeat was rejected")
 				}
 			}
-			if s.leader != 1 || s.leaderProposalNumber != 4 || s.readyLocked() {
+			if s.leader != 1 || s.leaderProposalNumber != (types.ProposalID{Round: 2, NodeID: 1}) || s.readyLocked() {
 				t.Fatal("Prepare/heartbeat failed to learn leader or incorrectly became ready")
 			}
 			var reply AcceptReply
-			s.Accept(&AcceptArgs{Seq: 3, ProposalNumber: 4, Value: OP{Action: "nop"}}, &reply)
-			if !reply.Accepted || s.leader != 1 || s.leaderProposalNumber != 4 {
+			s.Accept(&AcceptArgs{Seq: 3, ProposalNumber: types.ProposalID{Round: 2, NodeID: 1}, Value: OP{Action: "nop"}}, &reply)
+			if !reply.Accepted || s.leader != 1 || s.leaderProposalNumber != (types.ProposalID{Round: 2, NodeID: 1}) {
 				t.Fatal("same-term Accept changed known leadership")
 			}
 		})
+	}
+}
+
+func TestProposalIDGenerationAndRestart(t *testing.T) {
+	s, err := newServer(1, []string{"p0", "p1", "p2"}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := s.makeProposalNumberLocked(); n != (types.ProposalID{Round: 1, NodeID: 1}) {
+		t.Fatalf("first proposal: %+v", n)
+	}
+	for _, observed := range []types.ProposalID{
+		{Round: 2, NodeID: 0}, // The local node already wins the same-round tie.
+		{Round: 2, NodeID: 1}, // A retry must not reuse an observed proposal.
+		{Round: 3, NodeID: 2}, // A higher node ID wins the same-round tie.
+		{Round: 1 << 63, NodeID: 2},
+	} {
+		s.catchupRoundNumLocked(observed)
+		if n := s.makeProposalNumberLocked(); n.Compare(observed) <= 0 || n.NodeID != 1 {
+			t.Fatalf("generated %+v after observing %+v", n, observed)
+		}
+	}
+	promise := types.ProposalID{Round: s.round_num, NodeID: 1}
+	var reply LeaderPrepareReply
+	s.Prepare(&LeaderPrepareArgs{ProposalNumber: promise, LeaderID: 1}, &reply)
+	if !reply.Prepared {
+		t.Fatal("large proposal rejected")
+	}
+	restarted, err := newServer(1, s.peers, tDir(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.promisedProposalNumber != promise || restarted.round_num != s.round_num {
+		t.Fatal("restart lost the uint64 proposal or round")
+	}
+	restarted.catchupRoundNumLocked(restarted.promisedProposalNumber)
+	if n := restarted.makeProposalNumberLocked(); n.Compare(promise) <= 0 {
+		t.Fatalf("restart reused proposal: %+v <= %+v", n, promise)
+	}
+}
+
+func TestAcceptRejectsInvalidProposalID(t *testing.T) {
+	s := newProtocolServer(t, []string{"p0", "p1", "p2"})
+	for _, n := range []types.ProposalID{{}, {NodeID: 1}, {Round: 1, NodeID: 3}, {Round: 1, NodeID: ^uint64(0)}} {
+		var reply AcceptReply
+		s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: n, Value: OP{Action: "nop"}}, &reply)
+		if reply.Accepted || len(s.insts) != 0 || s.promisedProposalNumber != (types.ProposalID{}) {
+			t.Fatalf("invalid proposal mutated state: %+v", n)
+		}
 	}
 }

@@ -7,9 +7,11 @@ import (
 	"path/filepath"
 	"slices"
 	"time"
+
+	"6.5840/paxos/types"
 )
 
-const snapshotVersion = 3
+const snapshotVersion = 4
 
 type serverSnapshot struct {
 	Checkpoint             Checkpoint
@@ -20,8 +22,8 @@ type serverSnapshot struct {
 	Requests               map[string]RequestRecord
 	MaxSeq                 int
 	Applied                int
-	RoundNum               int
-	PromisedProposalNumber int
+	RoundNum               uint64
+	PromisedProposalNumber types.ProposalID
 }
 
 // load restores a snapshot before the server begins accepting RPCs.
@@ -110,9 +112,10 @@ func newServer(me int, peers []string, dataDir string) (*Server, error) {
 		own_number:             me,
 		proposalSlot:           make(chan struct{}, 1),
 		leader:                 -1,
-		leaderProposalNumber:   -1,
-		promisedProposalNumber: -1,
+		leaderProposalNumber:   types.ProposalID{},
+		promisedProposalNumber: types.ProposalID{},
 		lastHeartbeatTime:      time.Now(),
+		round_num:              1,
 		peers:                  peers,
 		majority:               len(peers)/2 + 1,
 		insts:                  make(map[int]Instance),

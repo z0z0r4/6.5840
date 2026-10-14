@@ -1,5 +1,7 @@
 package paxos
 
+import "6.5840/paxos/types"
+
 const catchUpBatchSize = 64
 
 // FetchLog returns only a contiguous prefix of decided entries, never accepted values.
@@ -28,7 +30,7 @@ func (s *Server) FetchLog(args *FetchLogArgs, reply *FetchLogReply) error {
 }
 
 // catchUp is retriggered by a subsequent heartbeat if a fetch fails or the leader changes.
-func (s *Server) catchUp(leader, proposalNumber, target int) {
+func (s *Server) catchUp(leader int, proposalNumber types.ProposalID, target int) {
 	defer func() {
 		s.mu.Lock()
 		s.catchingUp = false

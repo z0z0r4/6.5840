@@ -18,10 +18,13 @@ const (
 )
 
 type Config struct {
-	ID              int
-	Peers           []string
-	DataDir         string
-	Machine         statemachine.Machine
+	ID      int
+	Peers   []string
+	DataDir string
+	Machine statemachine.Machine
+	// Zero limits select 512 records / 16 MiB between disk checkpoints.
+	WALMaxRecords   int
+	WALMaxBytes     int64
 	SnapshotUpgrade func([]byte) (Snapshot, error)
 }
 type RequestRecord struct {

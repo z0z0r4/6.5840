@@ -16,10 +16,17 @@ type Instance struct {
 }
 
 type Node struct {
-	own_number int
-	peers      []string
-	majority   int
-	statePath  string
+	own_number        int
+	peers             []string
+	majority          int
+	statePath         string
+	walSequence       uint64
+	walRecords        int
+	walBytes          int64
+	walMaxRecords     int
+	walMaxBytes       int64
+	durableInsts      map[int]Instance
+	durableCheckpoint int
 
 	insts         map[int]Instance
 	machine       statemachine.Machine

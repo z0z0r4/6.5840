@@ -1,14 +1,16 @@
 package consensus
 
-import "fmt"
+import (
+	"fmt"
+	"log"
+)
 
 func (s *Node) decideLocked(seq int, instance Instance) (bool, error) {
 	ok, err := s.learnDecisionLocked(seq, instance)
 	if err != nil {
 		return false, err
 	}
-	s.applyLocked()
-	s.mustPersistLocked("Decide")
+	s.applyLearnedLocked("Decide")
 	return ok, nil
 }
 
@@ -36,6 +38,17 @@ func (s *Node) learnDecisionLocked(seq int, instance Instance) (bool, error) {
 	}
 
 	return true, nil
+}
+
+// applyLearnedLocked makes chosen entries durable before application writes.
+func (s *Node) applyLearnedLocked(operation string) {
+	s.mustPersistLocked(operation)
+	s.applyLocked()
+	if s.statePath != "" && s.checkpoint.Seq != s.durableCheckpoint {
+		if err := s.checkpointWALLocked(s.walSequence); err != nil {
+			log.Fatalf("checkpoint %s: %v", operation, err)
+		}
+	}
 }
 
 func (s *Node) Decide(args *DecideArgs, reply *DecideReply) error {

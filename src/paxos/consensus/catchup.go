@@ -61,20 +61,17 @@ func (s *Node) catchUp(leader int, proposalNumber types.ProposalID, target int) 
 		}
 		for i, entry := range reply.Entries {
 			if entry.Seq != start+i || !entry.Instance.Decided {
-				s.applyLocked()
-				s.mustPersistLocked("catch-up prefix")
+				s.applyLearnedLocked("catch-up prefix")
 				s.mu.Unlock()
 				return
 			}
 			if _, err := s.learnDecisionLocked(entry.Seq, entry.Instance); err != nil {
-				s.applyLocked()
-				s.mustPersistLocked("catch-up prefix")
+				s.applyLearnedLocked("catch-up prefix")
 				s.mu.Unlock()
 				return
 			}
 		}
-		s.applyLocked()
-		s.mustPersistLocked("catch-up batch")
+		s.applyLearnedLocked("catch-up batch")
 		s.mu.Unlock()
 	}
 }

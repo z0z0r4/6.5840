@@ -25,7 +25,7 @@ func (s *Server) compactLocked() {
 }
 func (s *Server) pruneLocked() {
 	for seq := range s.insts {
-		if seq <= s.checkpoint.Seq && !s.pinnedReads[seq] {
+		if seq <= s.checkpoint.Seq {
 			delete(s.insts, seq)
 		}
 	}

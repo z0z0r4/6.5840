@@ -25,11 +25,10 @@ type Server struct {
 	majority   int
 	statePath  string
 
-	insts       map[int]Instance
-	kv          map[string]string
-	requests    map[string]RequestRecord
-	checkpoint  Checkpoint
-	pinnedReads map[int]bool
+	insts      map[int]Instance
+	kv         map[string]string
+	requests   map[string]RequestRecord
+	checkpoint Checkpoint
 
 	phase                  leaderPhase
 	catchingUp             bool
@@ -37,8 +36,12 @@ type Server struct {
 	leader                 int
 	leaderProposalNumber   int
 	promisedProposalNumber int
-	heartbeatTicker        *time.Ticker
-	lastHeartbeatTime      time.Time
+
+	heartbeatTicker   *time.Ticker
+	lastHeartbeatTime time.Time
+
+	leaseGrantUntil time.Time
+	readLeaseUntil  time.Time
 
 	max_seq   int
 	applied   int
@@ -68,9 +71,6 @@ func (s *Server) applyLocked() {
 		switch inst.Op.Action {
 		case "set":
 			s.kv[inst.Op.Key] = inst.Op.Value
-		case "get":
-			inst.ReadValue = s.kv[inst.Op.Key]
-			s.insts[next_seq_apply] = inst
 		case "nop":
 			// do nothing
 		default:
@@ -111,11 +111,18 @@ func (s *Server) propose(ctx context.Context, op OP) proposalResult {
 		return proposalResult{status: status}
 	}
 
+	if op.Action == "get" {
+		if !time.Now().Before(s.readLeaseUntil) {
+			s.mu.Unlock()
+			return proposalResult{status: proposalExpired}
+		}
+		result := proposalResult{status: proposalApplied, value: s.kv[op.Key]}
+		s.mu.Unlock()
+		return result
+	}
+
 	proposalNumber, seq := s.leaderProposalNumber, s.max_seq+1
 
-	if op.Action == "get" {
-		s.pinnedReads[seq] = true
-	}
 	s.mu.Unlock()
 
 	completed := false
@@ -123,14 +130,6 @@ func (s *Server) propose(ctx context.Context, op OP) proposalResult {
 	defer func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-
-		if op.Action == "get" {
-			delete(s.pinnedReads, seq)
-			// Release a result retained through a concurrent compaction.
-			if seq <= s.checkpoint.Seq {
-				delete(s.insts, seq)
-			}
-		}
 
 		// An incomplete Accept may have left a hole. Recover before new slots.
 		if !completed {

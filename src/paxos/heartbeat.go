@@ -6,7 +6,9 @@ func (s *Server) heartbeatLocked(n int, leader int) bool {
 	if !s.validProposalNumber(n, leader) || !s.observeProposalNumberLocked(n) {
 		return false
 	}
-	s.lastHeartbeatTime = time.Now()
+	now := time.Now()
+	s.lastHeartbeatTime = now
+	s.leaseGrantUntil = now.Add(followerLeaseDuration)
 	return true
 }
 
@@ -17,6 +19,7 @@ func (s *Server) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 	result := s.heartbeatLocked(args.ProposalNumber, args.LeaderID)
 
 	reply.Result = result
+	reply.ProposalNumber = s.promisedProposalNumber
 	if result && args.LeaderID != s.own_number && args.Applied > s.applied && !s.catchingUp {
 		s.catchingUp = true
 		go s.catchUp(args.LeaderID, args.ProposalNumber, args.Applied)
@@ -26,6 +29,9 @@ func (s *Server) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
 
 // Use the caller's proposal number so a delayed heartbeat cannot adopt a newer term.
 func (s *Server) broadcastHeartbeat(proposalNumber int) int {
+	// Start before acquiring locks or doing I/O: delayed replies never extend
+	// the master deadline beyond the replicas' protection.
+	start := time.Now()
 	s.mu.Lock()
 	if !s.inLeaderProposalNumberLocked(proposalNumber) {
 		s.mu.Unlock()
@@ -37,7 +43,35 @@ func (s *Server) broadcastHeartbeat(proposalNumber int) int {
 	ch := fanout[HeartbeatReply](s, "Server.Heartbeat", &args, func(a, r any) error {
 		return s.Heartbeat(a.(*HeartbeatArgs), r.(*HeartbeatReply))
 	})
-	return countQuorum(s, ch, func(r HeartbeatReply) bool { return r.Result })
+	// Inspect even replies arriving after the quorum. A failed minority election
+	// can leave a higher promise that otherwise prevents that replica from ever
+	// following this master. Stop renewing and let electLeader recover a new term.
+	votes := make(chan rpcResult[HeartbeatReply], len(s.peers))
+	go func() {
+		for range s.peers {
+			r := <-ch
+			if r.err == nil && r.reply.ProposalNumber > proposalNumber {
+				s.mu.Lock()
+				if s.inLeaderProposalNumberLocked(proposalNumber) {
+					s.catchupRoundNumLocked(r.reply.ProposalNumber)
+					s.invalidateLeaderLocked(proposalNumber, true)
+				}
+				s.mu.Unlock()
+			}
+			votes <- r
+		}
+	}()
+	count := countQuorum(s, votes, func(r HeartbeatReply) bool { return r.Result })
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if count >= s.majority && s.inLeaderProposalNumberLocked(proposalNumber) &&
+		(s.phase == leaderReady || s.phase == leaderRecovering) {
+		until := start.Add(leaderLeaseDuration)
+		if time.Now().Before(until) && until.After(s.readLeaseUntil) {
+			s.readLeaseUntil = until
+		}
+	}
+	return count
 }
 
 func (s *Server) StartHeartbeat() {

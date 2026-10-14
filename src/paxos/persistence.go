@@ -54,6 +54,9 @@ func (s *Server) load() error {
 	s.applied = snapshot.Applied
 	s.round_num = snapshot.RoundNum
 	s.promisedProposalNumber = snapshot.PromisedProposalNumber
+	// A heartbeat grant is volatile. After restart, refuse all proposals for
+	// a full replica lease rather than forgetting a still-live commitment.
+	s.leaseGrantUntil = time.Now().Add(followerLeaseDuration)
 	return nil
 }
 
@@ -115,7 +118,6 @@ func newServer(me int, peers []string, dataDir string) (*Server, error) {
 		insts:                  make(map[int]Instance),
 		kv:                     make(map[string]string),
 		requests:               make(map[string]RequestRecord),
-		pinnedReads:            make(map[int]bool),
 		checkpoint:             Checkpoint{KV: make(map[string]string), Requests: make(map[string]RequestRecord)},
 		statePath:              filepath.Join(dataDir, fmt.Sprintf("peer-%d.gob", me)),
 	}

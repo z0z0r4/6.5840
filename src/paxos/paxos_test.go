@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -46,11 +47,12 @@ func (p *StateProbe) State(_ *struct{}, out *NodeState) error {
 }
 
 type testCluster struct {
-	t           *testing.T
-	peers       []string
-	procs       []*exec.Cmd
-	parentPipes []*os.File
-	root        string
+	t            *testing.T
+	peers        []string
+	procs        []*exec.Cmd
+	parentPipes  []*os.File
+	stoppedPorts []net.Listener
+	root         string
 	// Remember all decisions ever observed, including on subsequently killed nodes.
 	observed  map[int]NodeState
 	decisions map[int]OP
@@ -60,7 +62,7 @@ type testCluster struct {
 
 func newTestCluster(t *testing.T) *testCluster {
 	t.Helper()
-	c := &testCluster{t: t, peers: make([]string, 5), procs: make([]*exec.Cmd, 5), parentPipes: make([]*os.File, 5), root: t.TempDir(), decisions: make(map[int]OP)}
+	c := &testCluster{t: t, peers: make([]string, 5), procs: make([]*exec.Cmd, 5), parentPipes: make([]*os.File, 5), stoppedPorts: make([]net.Listener, 5), root: t.TempDir(), decisions: make(map[int]OP)}
 	if artifacts := os.Getenv("PAXOS_TEST_ARTIFACTS"); artifacts != "" {
 		if err := os.MkdirAll(artifacts, 0700); err != nil {
 			t.Fatal(err)
@@ -113,6 +115,9 @@ func newTestCluster(t *testing.T) *testCluster {
 	t.Cleanup(func() {
 		for i := range c.procs {
 			c.stop(i)
+			if c.stoppedPorts[i] != nil {
+				c.stoppedPorts[i].Close()
+			}
 		}
 		for i := range c.procs {
 			b, _ := os.ReadFile(c.logPath(i))
@@ -146,6 +151,22 @@ func (c *testCluster) stop(i int) {
 		c.procs[i] = nil
 		c.parentPipes[i].Close()
 		c.parentPipes[i] = nil
+		// Keep this server port out of the ephemeral client pool while stopped.
+		l, err := net.Listen("tcp", c.peers[i])
+		if err != nil {
+			c.t.Errorf("reserve stopped node %d port: %v", i, err)
+			return
+		}
+		c.stoppedPorts[i] = l
+		go func() {
+			for {
+				conn, err := l.Accept()
+				if err != nil {
+					return
+				}
+				conn.Close()
+			}
+		}()
 	}
 }
 
@@ -153,6 +174,10 @@ func (c *testCluster) start(i int) {
 	c.t.Helper()
 	if c.procs[i] != nil {
 		c.t.Fatalf("node %d already running", i)
+	}
+	if c.stoppedPorts[i] != nil {
+		c.stoppedPorts[i].Close()
+		c.stoppedPorts[i] = nil
 	}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestLeaderProcess$")
 	// Only the parent owns the write end. EOF also handles hard test timeouts,
@@ -687,8 +712,8 @@ func TestQueuedProposalCancellation(t *testing.T) {
 		t.Fatal("queued proposal ignored cancellation")
 	}
 	<-s.proposalSlot
-	if s.max_seq != 0 || len(s.pinnedReads) != 0 || !s.readyLocked() {
-		t.Fatal("queued cancellation mutated log, read pins or leadership")
+	if s.max_seq != 0 || !s.readyLocked() {
+		t.Fatal("queued cancellation mutated log or leadership")
 	}
 	result := s.propose(context.Background(), OP{ReqID: newRequestID(), Action: "set", Key: "k", Value: "ok"})
 	if result.status != proposalApplied {
@@ -701,6 +726,9 @@ func TestGetAtCompactionBoundary(t *testing.T) {
 	s.statePath = ""
 	s.lastHeartbeatTime = time.Now().Add(-2 * heartbeatTimeout)
 	s.electLeader()
+	if s.broadcastHeartbeat(s.leaderProposalNumber) != s.majority {
+		t.Fatal("failed to obtain read lease")
+	}
 	for seq := 1; seq < logRetention; seq++ {
 		decideOperation(t, s, seq, OP{Action: "set", Key: "k", Value: fmt.Sprint(seq)})
 	}
@@ -708,8 +736,12 @@ func TestGetAtCompactionBoundary(t *testing.T) {
 	if err := s.Get(&ClientGetRequest{Key: "k"}, &reply); err != nil || !reply.Result || reply.Value != fmt.Sprint(logRetention-1) {
 		t.Fatalf("read at compaction boundary: %+v %v", reply, err)
 	}
-	if s.checkpoint.Seq != logRetention || len(s.insts) != 0 || len(s.pinnedReads) != 0 {
-		t.Fatalf("completed read retained compacted state: checkpoint=%d entries=%d pins=%d", s.checkpoint.Seq, len(s.insts), len(s.pinnedReads))
+	if s.max_seq != logRetention-1 || s.checkpoint.Seq != 0 || len(s.insts) != logRetention-1 {
+		t.Fatal("local read changed the log or checkpoint")
+	}
+	decideOperation(t, s, logRetention, OP{Action: "set", Key: "k", Value: reply.Value})
+	if s.checkpoint.Seq != logRetention || len(s.insts) != 0 {
+		t.Fatalf("write did not compact state: checkpoint=%d entries=%d", s.checkpoint.Seq, len(s.insts))
 	}
 	var accepted AcceptReply
 	s.Accept(&AcceptArgs{Seq: logRetention, ProposalNumber: 0, Value: OP{Action: "set", Key: "k", Value: "bad"}}, &accepted)
@@ -758,7 +790,7 @@ func TestRejectedProposalNumbersDoNotChangePromise(t *testing.T) {
 func TestCheckpointIsolationAndAppliedSuffix(t *testing.T) {
 	s := newProtocolServer(t, []string{"p0"})
 	s.statePath = ""
-	decideOperation(t, s, 3, OP{Action: "get", Key: "k"})
+	decideOperation(t, s, 3, OP{Action: "set", Key: "suffix", Value: "applied"})
 	checkpoint := Checkpoint{Seq: 2, KV: map[string]string{"k": "prefix"}, Requests: map[string]RequestRecord{}}
 	s.mu.Lock()
 	s.installCheckpointLocked(checkpoint)
@@ -767,7 +799,7 @@ func TestCheckpointIsolationAndAppliedSuffix(t *testing.T) {
 	copy.KV["k"] = "reply mutation"
 	s.installCheckpointLocked(Checkpoint{Seq: 1, KV: map[string]string{"k": "older"}, Requests: map[string]RequestRecord{}})
 	s.mu.Unlock()
-	if s.applied != 3 || s.kv["k"] != "prefix" || s.checkpoint.KV["k"] != "prefix" || s.insts[3].ReadValue != "prefix" {
+	if s.applied != 3 || s.kv["k"] != "prefix" || s.checkpoint.KV["k"] != "prefix" || s.kv["suffix"] != "applied" {
 		t.Fatal("checkpoint aliases caller data, regresses state, or loses the decided suffix")
 	}
 }
@@ -902,18 +934,22 @@ func TestHigherProposalNumberInvalidatesLeader(t *testing.T) {
 					t.Fatal("higher heartbeat rejected")
 				}
 			}
+			leader, leaderProposalNumber := 1, 4
+			if source == "accept" {
+				leader, leaderProposalNumber = -1, -1
+			}
 			s.mu.Lock()
-			if s.readyLocked() || s.phase != leaderFollower || s.leader != 1 || s.leaderProposalNumber != 4 || s.promisedProposalNumber != 4 {
-				t.Fatal("higher proposal number did not replace the old leadership")
+			if s.readyLocked() || s.phase != leaderFollower || s.leader != leader || s.leaderProposalNumber != leaderProposalNumber || s.promisedProposalNumber != 4 {
+				t.Fatal("higher proposal number did not invalidate the old leadership correctly")
 			}
 			// A delayed failure from the old term must not invalidate the new one.
 			s.invalidateLeaderLocked(0, true)
-			if s.leader != 1 {
-				t.Fatal("old-term failure cleared the new leader")
+			if s.leader != leader {
+				t.Fatal("old-term failure changed the leadership")
 			}
 			s.mu.Unlock()
 			result := s.propose(context.Background(), OP{Action: "get", Key: "k"})
-			if result.status != proposalRedirect || result.leader != 1 {
+			if result.status != proposalRedirect || result.leader != leader {
 				t.Fatalf("old leader served a new proposal: %+v", result)
 			}
 			s, err = newServer(0, peers, dir)
@@ -1700,5 +1736,266 @@ func TestFailedRecoveryLeavesFollower(t *testing.T) {
 	s := nodes[0]
 	if s.phase != leaderFollower || s.leader != -1 {
 		t.Fatal("failed recovery left a heartbeat-producing leader")
+	}
+}
+
+func TestHeartbeatLeaseProtectsProposalNumber(t *testing.T) {
+	for _, source := range []string{"prepare", "accept", "heartbeat"} {
+		t.Run(source, func(t *testing.T) {
+			s := newProtocolServer(t, []string{"p0", "p1", "p2"})
+			var granted HeartbeatReply
+			s.Heartbeat(&HeartbeatArgs{LeaderID: 1, ProposalNumber: 4}, &granted)
+			if !granted.Result {
+				t.Fatal("initial lease rejected")
+			}
+			attempt := func() bool {
+				switch source {
+				case "prepare":
+					var r LeaderPrepareReply
+					s.Prepare(&LeaderPrepareArgs{LeaderID: 2, ProposalNumber: 8}, &r)
+					return r.Prepared
+				case "accept":
+					var r AcceptReply
+					s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: 8, Value: OP{Action: "nop"}}, &r)
+					return r.Accepted
+				default:
+					var r HeartbeatReply
+					s.Heartbeat(&HeartbeatArgs{LeaderID: 2, ProposalNumber: 8}, &r)
+					return r.Result
+				}
+			}
+			until := s.leaseGrantUntil
+			if attempt() || s.promisedProposalNumber != 4 || s.leaseGrantUntil != until || s.max_seq != 0 {
+				t.Fatal("another proposal bypassed or mutated the live lease")
+			}
+			// Same-term traffic is allowed while other proposals are excluded.
+			var accepted AcceptReply
+			s.Accept(&AcceptArgs{Seq: 1, ProposalNumber: 4, Value: OP{Action: "nop"}}, &accepted)
+			if !accepted.Accepted {
+				t.Fatal("lease blocked its owner")
+			}
+			s.leaseGrantUntil = time.Now().Add(-time.Second)
+			if !attempt() || s.promisedProposalNumber != 8 {
+				t.Fatal("expired lease prevented takeover")
+			}
+		})
+	}
+}
+
+func TestPeriodicHeartbeatRenewsLocalReads(t *testing.T) {
+	s := newProtocolServer(t, []string{"p0"})
+	s.lastHeartbeatTime = time.Now().Add(-2 * heartbeatTimeout)
+	s.electLeader()
+	decideOperation(t, s, 1, OP{Action: "set", Key: "k", Value: "v"})
+	if r := s.propose(context.Background(), OP{Action: "get", Key: "k"}); r.status != proposalExpired {
+		t.Fatalf("read without a lease succeeded: %+v", r)
+	}
+	s.StartHeartbeat()
+	t.Cleanup(func() { s.heartbeatTicker.Stop() })
+	deadline := time.Now().Add(2 * time.Second)
+	var first time.Time
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		first = s.readLeaseUntil
+		s.mu.Unlock()
+		if !first.IsZero() {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if first.IsZero() {
+		t.Fatal("periodic heartbeat did not grant a read lease")
+	}
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		renewed := s.readLeaseUntil.After(first)
+		s.mu.Unlock()
+		if renewed {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	s.heartbeatTicker.Stop()
+	s.mu.Lock()
+	if !s.readLeaseUntil.After(first) {
+		s.mu.Unlock()
+		t.Fatal("periodic heartbeat did not renew the lease")
+	}
+	// Stop renewal. Reads must use the existing lease and touch no log.
+	until, seq, applied := s.readLeaseUntil, s.max_seq, s.applied
+	s.mu.Unlock()
+	for i := 0; i < 10; i++ {
+		if r := s.propose(context.Background(), OP{Action: "get", Key: "k"}); r.status != proposalApplied || r.value != "v" {
+			t.Fatalf("leased local read: %+v", r)
+		}
+	}
+	s.mu.Lock()
+	if s.readLeaseUntil != until || s.max_seq != seq || s.applied != applied {
+		s.mu.Unlock()
+		t.Fatal("read renewed its lease or changed the log")
+	}
+	s.readLeaseUntil = time.Now().Add(-time.Second)
+	s.mu.Unlock()
+	if r := s.propose(context.Background(), OP{Action: "get", Key: "k"}); r.status != proposalExpired {
+		t.Fatalf("ready leader served a read after lease expiration: %+v", r)
+	}
+}
+
+func TestLeaseRestartProtection(t *testing.T) {
+	s := newProtocolServer(t, []string{"p0", "p1", "p2"})
+	var granted HeartbeatReply
+	s.Heartbeat(&HeartbeatArgs{LeaderID: 1, ProposalNumber: 4}, &granted)
+	restarted, err := newServer(0, s.peers, tDir(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []int{4, 8} {
+		var r HeartbeatReply
+		restarted.Heartbeat(&HeartbeatArgs{LeaderID: n % 3, ProposalNumber: n}, &r)
+		if r.Result || restarted.promisedProposalNumber != 4 || !restarted.readLeaseUntil.IsZero() {
+			t.Fatal("restart forgot lease protection or restored a read lease")
+		}
+	}
+	restarted.leaseGrantUntil = time.Now().Add(-time.Second)
+	var prepared LeaderPrepareReply
+	restarted.Prepare(&LeaderPrepareArgs{LeaderID: 2, ProposalNumber: 8}, &prepared)
+	if !prepared.Prepared {
+		t.Fatal("restart protection never allowed a new leader")
+	}
+}
+
+func TestHeartbeatWithoutQuorumDoesNotGrantReadLease(t *testing.T) {
+	s := newProtocolServer(t, []string{"p0", "127.0.0.1:0", "127.0.0.1:0"})
+	s.observeProposalNumberLocked(0)
+	s.phase = leaderReady
+	if s.broadcastHeartbeat(0) >= s.majority || !s.readLeaseUntil.IsZero() {
+		t.Fatal("local heartbeat alone established a master lease")
+	}
+	if r := s.propose(context.Background(), OP{Action: "get", Key: "k"}); r.status != proposalExpired {
+		t.Fatal("isolated ready leader served a read without quorum lease")
+	}
+}
+
+// A paused master keeps its ready phase while its lease expires. A new master
+// may then commit, but resuming the old process must never expose stale data.
+func TestFiveNodePausedMasterLease(t *testing.T) {
+	c := newTestCluster(t)
+	c.set("lease", "before")
+	c.converge(map[string]string{"lease": "before"})
+	old := c.leader().ID
+	if err := c.procs[old].Process.Signal(syscall.SIGSTOP); err != nil {
+		t.Fatal(err)
+	}
+	majority := []int{(old + 1) % 5, (old + 2) % 5, (old + 3) % 5, (old + 4) % 5}
+	c.partition([]int{old}, majority)
+	if !c.client(majority[0]).Send_set("lease", "after") {
+		t.Fatal("new master could not write after the old lease expired")
+	}
+	if err := c.procs[old].Process.Signal(syscall.SIGCONT); err != nil {
+		t.Fatal(err)
+	}
+	var reply ClientGetResponse
+	if err := callWithTimeout(c.peers[old], "Server.Get", &ClientGetRequest{Key: "lease"}, &reply, clientAttemptTimeout); err != nil {
+		t.Fatal(err)
+	}
+	if reply.Result {
+		t.Fatalf("resumed isolated master served stale data: %+v", reply)
+	}
+	ok, value := c.client(majority[0]).Send_get("lease")
+	if !ok || value != "after" {
+		t.Fatalf("new master read: value=%q ok=%v", value, ok)
+	}
+	c.heal(false)
+	c.converge(map[string]string{"lease": "after"})
+}
+
+func TestHeartbeatLateHigherPromiseStopsRenewal(t *testing.T) {
+	peers := []string{"local", "", ""}
+	for i := 1; i < len(peers); i++ {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		peers[i] = l.Addr().String()
+		t.Cleanup(func() { l.Close() })
+		registry := rpc.NewServer()
+		if err := registry.RegisterName("Server", &leaseHeartbeatPeer{higher: i == 2}); err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			for {
+				conn, err := l.Accept()
+				if err != nil {
+					return
+				}
+				go registry.ServeConn(conn)
+			}
+		}()
+	}
+	s := newProtocolServer(t, peers)
+	s.observeProposalNumberLocked(0)
+	s.phase = leaderReady
+	if s.broadcastHeartbeat(0) != s.majority {
+		t.Fatal("initial majority heartbeat failed")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		stopped := s.phase == leaderFollower && s.readLeaseUntil.IsZero() && s.round_num >= 3
+		s.mu.Unlock()
+		if stopped {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("late higher promise did not stop the old master or advance its next round")
+}
+
+type leaseHeartbeatPeer struct{ higher bool }
+
+func (p *leaseHeartbeatPeer) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
+	if p.higher {
+		time.Sleep(50 * time.Millisecond)
+		reply.ProposalNumber = 8
+	} else {
+		reply.Result = true
+		reply.ProposalNumber = args.ProposalNumber
+	}
+	return nil
+}
+
+func TestAcceptDoesNotLearnLeader(t *testing.T) {
+	for _, source := range []string{"prepare", "heartbeat"} {
+		t.Run(source, func(t *testing.T) {
+			s := newProtocolServer(t, []string{"p0", "p1", "p2"})
+			for seq := 1; seq <= 2; seq++ {
+				var reply AcceptReply
+				s.Accept(&AcceptArgs{Seq: seq, ProposalNumber: 4, Value: OP{Action: "nop"}}, &reply)
+				if !reply.Accepted || s.promisedProposalNumber != 4 || s.leader != -1 || s.leaderProposalNumber != -1 || s.readyLocked() {
+					t.Fatal("Accept learned leadership instead of only updating the promise")
+				}
+			}
+			if source == "prepare" {
+				var reply LeaderPrepareReply
+				s.Prepare(&LeaderPrepareArgs{ProposalNumber: 4, LeaderID: 1}, &reply)
+				if !reply.Prepared {
+					t.Fatal("same-promise Prepare was rejected")
+				}
+			} else {
+				var reply HeartbeatReply
+				s.Heartbeat(&HeartbeatArgs{ProposalNumber: 4, LeaderID: 1}, &reply)
+				if !reply.Result {
+					t.Fatal("same-promise heartbeat was rejected")
+				}
+			}
+			if s.leader != 1 || s.leaderProposalNumber != 4 || s.readyLocked() {
+				t.Fatal("Prepare/heartbeat failed to learn leader or incorrectly became ready")
+			}
+			var reply AcceptReply
+			s.Accept(&AcceptArgs{Seq: 3, ProposalNumber: 4, Value: OP{Action: "nop"}}, &reply)
+			if !reply.Accepted || s.leader != 1 || s.leaderProposalNumber != 4 {
+				t.Fatal("same-term Accept changed known leadership")
+			}
+		})
 	}
 }

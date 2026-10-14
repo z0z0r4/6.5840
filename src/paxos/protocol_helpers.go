@@ -3,6 +3,7 @@ package paxos
 import (
 	"context"
 	"log"
+	"time"
 )
 
 type leaderPhase uint8
@@ -46,24 +47,35 @@ func (s *Server) validProposalNumber(proposalNumber, leader int) bool {
 	return leader >= 0 && leader < len(s.peers) && proposalNumber >= 0 && proposalNumber%len(s.peers) == leader
 }
 
-// observeProposalNumberLocked is the single transition for learning a higher promise.
-func (s *Server) observeProposalNumberLocked(proposalNumber int) bool {
+// promiseProposalNumberLocked enforces leases and advances the global promise.
+// Accept uses this without learning the proposer's leadership identity.
+func (s *Server) promiseProposalNumberLocked(proposalNumber int) bool {
+	// On restart the lease owner is unknown, so every proposal waits out the
+	// protection period. A live grant permits only its existing proposal number.
+	if proposalNumber != s.leaderProposalNumber && time.Now().Before(s.leaseGrantUntil) {
+		return false
+	}
 	if proposalNumber < s.promisedProposalNumber {
 		return false
 	}
 	if proposalNumber > s.promisedProposalNumber {
 		s.promisedProposalNumber = proposalNumber
 		s.phase = leaderFollower
-		s.leader = proposalNumber % len(s.peers)
-		s.leaderProposalNumber = proposalNumber
+		s.readLeaseUntil = time.Time{}
+		s.leader = -1
+		s.leaderProposalNumber = -1
 		s.mustPersistLocked("promise")
-	} else if s.leader == -1 {
-		// Leadership identity is volatile, while the promise survives restart.
-		s.leader = proposalNumber % len(s.peers)
-		s.leaderProposalNumber = proposalNumber
-	} else if s.leaderProposalNumber != proposalNumber || s.leader != proposalNumber%len(s.peers) {
+	}
+	return true
+}
+
+// Prepare and heartbeat identify the leader; Accept only establishes a promise.
+func (s *Server) observeProposalNumberLocked(proposalNumber int) bool {
+	if !s.promiseProposalNumberLocked(proposalNumber) {
 		return false
 	}
+	s.leader = proposalNumber % len(s.peers)
+	s.leaderProposalNumber = proposalNumber
 	return true
 }
 
@@ -72,6 +84,7 @@ func (s *Server) invalidateLeaderLocked(proposalNumber int, clearLeader bool) {
 		return
 	}
 	s.phase = leaderFollower
+	s.readLeaseUntil = time.Time{}
 	if clearLeader {
 		s.leader = -1
 	}
@@ -91,8 +104,7 @@ func (s *Server) proposedResultLocked(seq int, op OP) proposalResult {
 		if inst, ok := s.insts[seq]; ok {
 			return proposalResult{status: proposalApplied, value: inst.ReadValue}
 		}
-		// The slot may already be in the checkpoint; the read value is not
-		// recoverable from the current KV map, so its pin must keep it present.
+		// Historical reads may have been compacted; their result is unavailable.
 		return proposalResult{status: proposalExpired}
 	}
 	return proposalResult{status: proposalApplied}

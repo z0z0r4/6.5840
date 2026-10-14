@@ -6,7 +6,6 @@ func (s *Server) acceptLocked(seq int, proposalNumber int, value OP) bool {
 	if seq <= s.checkpoint.Seq {
 		return false
 	}
-	s.noteSeq(seq)
 
 	inst, exists := s.insts[seq]
 	if !exists {
@@ -22,7 +21,10 @@ func (s *Server) acceptLocked(seq int, proposalNumber int, value OP) bool {
 	if inst.ProposalAcceptNumber == proposalNumber && inst.Op != value {
 		return false
 	}
-	s.observeProposalNumberLocked(proposalNumber)
+	if !s.promiseProposalNumberLocked(proposalNumber) {
+		return false
+	}
+	s.noteSeq(seq)
 	inst.ProposalAcceptNumber, inst.Op = proposalNumber, value
 	s.insts[seq] = inst
 	s.mustPersistLocked("Accept")

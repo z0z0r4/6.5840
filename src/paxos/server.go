@@ -37,8 +37,12 @@ type Server struct {
 	leader                 int
 	leaderProposalNumber   int
 	promisedProposalNumber int
-	heartbeatTicker        *time.Ticker
-	lastHeartbeatTime      time.Time
+
+	heartbeatTicker   *time.Ticker
+	lastHeartbeatTime time.Time
+
+	leaseGrantUntil time.Time
+	readLeaseUntil  time.Time
 
 	max_seq   int
 	applied   int
@@ -111,11 +115,18 @@ func (s *Server) propose(ctx context.Context, op OP) proposalResult {
 		return proposalResult{status: status}
 	}
 
-	proposalNumber, seq := s.leaderProposalNumber, s.max_seq+1
+	// The lease only permits local reads; otherwise use the normal proposal.
+	if op.Action == "get" && time.Now().Before(s.readLeaseUntil) {
+		result := proposalResult{status: proposalApplied, value: s.kv[op.Key]}
+		s.mu.Unlock()
+		return result
+	}
 
+	proposalNumber, seq := s.leaderProposalNumber, s.max_seq+1
 	if op.Action == "get" {
 		s.pinnedReads[seq] = true
 	}
+
 	s.mu.Unlock()
 
 	completed := false
@@ -126,7 +137,6 @@ func (s *Server) propose(ctx context.Context, op OP) proposalResult {
 
 		if op.Action == "get" {
 			delete(s.pinnedReads, seq)
-			// Release a result retained through a concurrent compaction.
 			if seq <= s.checkpoint.Seq {
 				delete(s.insts, seq)
 			}

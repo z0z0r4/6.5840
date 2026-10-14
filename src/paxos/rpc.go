@@ -108,7 +108,8 @@ type FetchLogReply struct {
 }
 
 type HeartbeatReply struct {
-	Result bool
+	Result         bool
+	ProposalNumber int
 }
 
 func call(peer, method string, args any, reply any) error {

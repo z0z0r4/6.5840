@@ -518,7 +518,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 			conflictTerm := rf.getLogLocked(args.PrevLogIndex).Term
 			conflictIndex := args.PrevLogIndex
-			for conflictIndex > 0 && rf.getLogLocked(conflictIndex-1).Term == conflictTerm {
+			for conflictIndex > rf.lastIncludeIndex && rf.getLogLocked(conflictIndex-1).Term == conflictTerm {
 				conflictIndex--
 			}
 			reply.ConflictTerm = conflictTerm

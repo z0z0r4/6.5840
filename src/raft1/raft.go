@@ -562,19 +562,6 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 	return ok
 }
 
-func (rf *Raft) canBeCommittedLocked(index int) bool {
-	count := 0
-	for i := 0; i < len(rf.peers); i++ {
-		if rf.matchIndex[i] >= index {
-			count++
-		}
-	}
-	if count > len(rf.peers)/2 {
-		return true
-	}
-	return false
-}
-
 func (rf *Raft) sendAppendEntriesToServer(server int) {
 	rf.mu.Lock()
 	next_index := rf.nextIndex[server]
@@ -622,11 +609,25 @@ func (rf *Raft) sendAppendEntriesToServer(server int) {
 		}
 
 		// Check if the log entry has been committed by a majority of servers
-		if rf.canBeCommittedLocked(rf.logEndLocked()-1) && rf.logEndLocked()-1 > rf.commitIndex {
-			// update commitIndex
-			rf.commitIndex = rf.logEndLocked() - 1
-			rf.applierCond.Signal()
-			// println("Server", rf.me, "committed log entry at index", rf.commitIndex, "for term", rf.currentTerm)
+		for n := rf.logEndLocked() - 1; n > rf.commitIndex; n-- {
+			// !Consider §5.4.2 Figure 8, old term entries should not be committed by new term leaders,
+			// They can only be committed when the leader commits an entry behind them in the current
+			if rf.getLogLocked(n).Term != rf.currentTerm {
+				break
+			}
+
+			// If the log entry is from the current term, consider it for commitment
+			count := 0
+			for i := 0; i < len(rf.peers); i++ {
+				if rf.matchIndex[i] >= n {
+					count++
+				}
+			}
+			if count > len(rf.peers)/2 {
+				rf.commitIndex = n
+				rf.applierCond.Signal()
+				break
+			}
 		}
 
 		// update next_index

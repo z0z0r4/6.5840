@@ -654,7 +654,7 @@ func (rf *Raft) sendAppendEntriesToServer(server int) {
 		} else {
 			// Find the last index of the conflicting term in the log
 			conflictIndex := -1
-			for i := rf.logEndLocked() - 1; i >= 0; i-- {
+			for i := rf.logEndLocked() - 1; i >= rf.lastIncludeIndex; i-- {
 				if rf.getLogLocked(i).Term == reply.ConflictTerm {
 					// Found the last index of the conflicting term
 					conflictIndex = i

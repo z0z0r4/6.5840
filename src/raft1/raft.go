@@ -564,6 +564,11 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 
 func (rf *Raft) sendAppendEntriesToServer(server int) {
 	rf.mu.Lock()
+	if rf.state != Leader {
+		// We may have stepped down since this was scheduled, don't send entries under a newer term
+		rf.mu.Unlock()
+		return
+	}
 	next_index := rf.nextIndex[server]
 	if next_index <= rf.lastIncludeIndex {
 		// Need to send InstallSnapshot RPC instead of AppendEntries
@@ -667,6 +672,10 @@ func (rf *Raft) sendAppendEntriesToServer(server int) {
 
 func (rf *Raft) sendInstallSnapshotToServer(server int) {
 	rf.mu.Lock()
+	if rf.state != Leader {
+		rf.mu.Unlock()
+		return
+	}
 	args := &InstallSnapshotArgs{
 		Term:              rf.currentTerm,
 		LeaderId:          rf.me,
@@ -752,7 +761,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, log_term, true
 }
 
-func (rf *Raft) sendRequestVoteToServer(server int, args *RequestVoteArgs) {
+func (rf *Raft) sendRequestVoteToServer(server int, candidateId int, term int, lastLogIndex int, lastLogTerm int) {
+	rf.mu.Lock()
+	if rf.state != Candidate || rf.currentTerm != term {
+		rf.mu.Unlock()
+		return
+	}
+	rf.mu.Unlock()
+
+	args := &RequestVoteArgs{}
+	args.CandidateId = candidateId
+	args.Term = term
+	args.LastLogIndex = lastLogIndex
+	args.LastLogTerm = lastLogTerm
 	reply := &RequestVoteReply{}
 
 	ok := rf.sendRequestVote(server, args, reply)
@@ -799,15 +820,10 @@ func (rf *Raft) electionLocked() {
 
 	rf.lastHeartbeat = time.Now()
 
-	election_term := rf.currentTerm
-	last_log_index := rf.logEndLocked() - 1
-	last_log_term := rf.getLogLocked(last_log_index).Term
-
-	args := &RequestVoteArgs{}
-	args.CandidateId = rf.me
-	args.Term = election_term
-	args.LastLogIndex = last_log_index
-	args.LastLogTerm = last_log_term
+	candidateId := rf.me
+	term := rf.currentTerm
+	lastLogIndex := rf.logEndLocked() - 1
+	lastLogTerm := rf.getLogLocked(lastLogIndex).Term
 
 	// Boardcast RequestVote RPCs to all other servers
 	for i := 0; i < len(rf.peers); i++ {
@@ -815,7 +831,7 @@ func (rf *Raft) electionLocked() {
 			continue
 		}
 
-		go rf.sendRequestVoteToServer(i, args)
+		go rf.sendRequestVoteToServer(i, candidateId, term, lastLogIndex, lastLogTerm)
 	}
 }
 

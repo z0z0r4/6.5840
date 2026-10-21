@@ -588,7 +588,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Update commit index
 	// println("Server", rf.me, "received AppendEntries RPC from leader", args.LeaderId, "for term", args.Term, "with LeaderCommit", args.LeaderCommit, "current commitIndex", rf.commitIndex)
 	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, rf.logEndLocked()-1)
+		// (as follower) Only entries known to match the leader's log may be committed
+		rf.commitIndex = max(rf.commitIndex, min(args.LeaderCommit, prevLogIndex+len(entries)))
 		// println("Server", rf.me, "updating commitIndex to", rf.commitIndex)
 		rf.applierCond.Signal()
 	} else {

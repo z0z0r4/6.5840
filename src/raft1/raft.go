@@ -588,7 +588,8 @@ func (rf *Raft) sendAppendEntriesToServer(server int) {
 	args.LeaderId = rf.me
 	args.PrevLogIndex = next_index - 1
 	args.PrevLogTerm = rf.getLogLocked(args.PrevLogIndex).Term
-	args.Entries = rf.log[next_index-rf.lastIncludeIndex:]
+	// Copy: the RPC encodes args after we release the lock, while rf.log may be modified
+	args.Entries = append([]LogEntry(nil), rf.log[next_index-rf.lastIncludeIndex:]...)
 	args.LeaderCommit = rf.commitIndex
 	rf.mu.Unlock()
 

@@ -311,11 +311,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// Update snapshot
 	rf.snapshot = args.Data
 
-	// Trim the log to remove entries that are included in the snapshot
-	if rf.logEndLocked()-1 < args.LastIncludedIndex {
-		rf.log = []LogEntry{{Term: args.LastIncludedTerm}}
-	} else {
+	// Keep the following entries only if our log agrees with the snapshot,
+	// otherwise discard the whole log.
+	if rf.logEndLocked()-1 >= args.LastIncludedIndex && rf.getLogLocked(args.LastIncludedIndex).Term == args.LastIncludedTerm {
 		rf.trimLogLocked(args.LastIncludedIndex)
+	} else {
+		rf.log = []LogEntry{{Term: args.LastIncludedTerm}}
 	}
 
 	// Update lastIncludeIndex and lastIncludeTerm

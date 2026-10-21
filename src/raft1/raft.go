@@ -54,6 +54,8 @@ type Raft struct {
 	matchIndex []int
 
 	lastHeartbeat time.Time
+	// Randomized once per election, re-drawing it on every tick would make it close to the minimum
+	electionTimeout time.Duration
 
 	lastIncludeIndex int
 	lastIncludeTerm  int
@@ -205,6 +207,10 @@ func (rf *Raft) BecomeLeaderLocked() {
 		rf.nextIndex[i] = rf.logEndLocked()
 		rf.matchIndex[i] = 0
 	}
+}
+
+func (rf *Raft) resetElectionTimeoutLocked() {
+	rf.electionTimeout = time.Duration(300+rand.Intn(300)) * time.Millisecond
 }
 
 func (rf *Raft) BecomeFollowerLocked(term int) {
@@ -819,6 +825,7 @@ func (rf *Raft) electionLocked() {
 	rf.votes = 1
 
 	rf.lastHeartbeat = time.Now()
+	rf.resetElectionTimeoutLocked()
 
 	candidateId := rf.me
 	term := rf.currentTerm
@@ -849,7 +856,7 @@ func (rf *Raft) ticker() {
 	for true {
 		// Your code here (3A)
 		rf.mu.Lock()
-		if rf.state != Leader && time.Since(rf.lastHeartbeat) > time.Duration(300+rand.Intn(300))*time.Millisecond {
+		if rf.state != Leader && time.Since(rf.lastHeartbeat) > rf.electionTimeout {
 			rf.electionLocked()
 		}
 		if rf.state == Leader && time.Since(rf.lastHeartbeat) > 100*time.Millisecond {
@@ -901,6 +908,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *tester.Persister, applyC
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.lastHeartbeat = time.Now()
+	rf.resetElectionTimeoutLocked()
 	rf.lastIncludeIndex = 0
 	rf.lastIncludeTerm = 0
 	rf.snapshot = nil

@@ -530,7 +530,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.lastHeartbeat = time.Now()
 
 	// Check prev log index and term
-	if args.PrevLogIndex >= rf.logEndLocked() || (args.PrevLogIndex >= 0 && rf.getLogLocked(args.PrevLogIndex).Term != args.PrevLogTerm) {
+
+	// Three statuses of snapshot:
+	// 1. prevLogIndex before lastIncludeIndex: move PrevLogIndex forward to lastIncludeIndex, then check term
+	// 2. between lastIncludeIndex and logEnd: check term
+	// 3. after logEnd: reject and reply conflict info, next RPC will move backward
+	prevLogIndex := args.PrevLogIndex
+	entries := args.Entries
+	mismatch := false
+	if prevLogIndex < rf.lastIncludeIndex {
+		// Entries up to lastIncludeIndex are committed and already in our snapshot, skip them
+		skip := min(rf.lastIncludeIndex-prevLogIndex, len(entries))
+		entries = entries[skip:]
+		prevLogIndex += skip
+		if prevLogIndex < rf.lastIncludeIndex {
+			// Everything in this follower is covered by the snapshot
+			reply.Success = true
+			reply.Term = rf.currentTerm
+			return
+		}
+	} else if prevLogIndex < rf.logEndLocked() && rf.getLogLocked(prevLogIndex).Term != args.PrevLogTerm {
+		mismatch = true
+	}
+
+	if mismatch || prevLogIndex >= rf.logEndLocked() {
+		// Log inconsistency, reject the AppendEntries RPC and provide conflict info
 		reply.Success = false
 		reply.Term = rf.currentTerm
 
@@ -554,9 +578,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// reset heartbeat timer
 	rf.lastHeartbeat = time.Now()
 
-	if len(args.Entries) > 0 {
-		rf.addLogLocked(args.Entries, args.PrevLogIndex+1)
-		println("Server", rf.me, "added", len(args.Entries), "log entries [", args.PrevLogIndex+1, "-", args.PrevLogIndex+len(args.Entries), "] from leader", args.LeaderId, "for term", args.Term)
+	if len(entries) > 0 {
+		rf.addLogLocked(entries, prevLogIndex+1)
+		println("Server", rf.me, "added", len(entries), "log entries [", prevLogIndex+1, "-", prevLogIndex+len(entries), "] from leader", args.LeaderId, "for term", args.Term)
 	} else {
 		// println("Server", rf.me, "received heartbeat from leader", args.LeaderId, "for term", args.Term)
 	}

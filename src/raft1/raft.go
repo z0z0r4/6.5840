@@ -63,6 +63,9 @@ type Raft struct {
 
 	applyCh     chan raftapi.ApplyMsg
 	applierCond *sync.Cond
+
+	// A snapshot installed from the leader that applier still has to deliver.
+	pendingSnapshot bool
 }
 
 // Logical index -> physical index in rf.log
@@ -318,23 +321,23 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// Update lastIncludeIndex and lastIncludeTerm
 	rf.lastIncludeIndex = args.LastIncludedIndex
 	rf.lastIncludeTerm = args.LastIncludedTerm
+
+	// If the service has already applied past the snapshot, delivering it would roll its state back
+	deliver := args.LastIncludedIndex > rf.lastApplied
+
 	rf.lastApplied = max(rf.lastApplied, args.LastIncludedIndex)
 
 	rf.persistLocked()
 
 	println("Server", rf.me, "installed snapshot from leader", args.LeaderId, "up to index", rf.lastIncludeIndex, "term", rf.lastIncludeTerm, "log length after trim", rf.logEndLocked())
 
-	msg := raftapi.ApplyMsg{
-		CommandValid:  false,
-		SnapshotValid: true,
-		Snapshot:      rf.snapshot,
-		SnapshotTerm:  rf.lastIncludeTerm,
-		SnapshotIndex: rf.lastIncludeIndex,
+	// Let applier deliver it, so that it can't be reordered with applied entries
+	if deliver {
+		rf.pendingSnapshot = true
+		rf.applierCond.Signal()
 	}
 
 	rf.mu.Unlock()
-
-	rf.applyCh <- msg
 }
 
 // example RequestVote RPC handler.
@@ -469,8 +472,21 @@ func (rf *Raft) applier() {
 
 	for {
 		rf.mu.Lock()
-		for rf.commitIndex <= rf.lastApplied {
+		for rf.commitIndex <= rf.lastApplied && !rf.pendingSnapshot {
 			rf.applierCond.Wait()
+		}
+
+		if rf.pendingSnapshot {
+			rf.pendingSnapshot = false
+			msg := raftapi.ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      rf.snapshot,
+				SnapshotTerm:  rf.lastIncludeTerm,
+				SnapshotIndex: rf.lastIncludeIndex,
+			}
+			rf.mu.Unlock()
+			rf.applyCh <- msg
+			continue
 		}
 
 		entries := make([]raftapi.ApplyMsg, 0, rf.commitIndex-rf.lastApplied)

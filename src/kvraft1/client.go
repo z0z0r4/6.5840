@@ -1,16 +1,17 @@
 package kvraft
 
 import (
-	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
-	"6.5840/tester1"
-)
+	"time"
 
+	"6.5840/kvsrv1/rpc"
+	kvtest "6.5840/kvtest1"
+	tester "6.5840/tester1"
+)
 
 type Clerk struct {
 	clnt    *tester.Clnt
 	servers []string
-	leader int // last successful leader (index into servers[])
+	leader  int // last successful leader (index into servers[])
 	// You can add to this struct.
 }
 
@@ -35,9 +36,28 @@ func (ck *Clerk) Leader() int {
 // must match the declared types of the RPC handler function's
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
+	for {
+		args := rpc.GetArgs{Key: key}
+		reply := rpc.GetReply{}
+		ok := ck.clnt.Call(ck.servers[ck.leader], "KVServer.Get", &args, &reply)
+		if ok {
+			switch reply.Err {
+			case rpc.OK:
+				return reply.Value, reply.Version, reply.Err
+			case rpc.ErrNoKey:
+				return "", 0, reply.Err
+			case rpc.ErrWrongLeader:
+				// println("Get failed, errWrongLeader, try next server", ck.leader)
+			default:
+				println("Get failed, try next server", ck.leader, reply.Err)
+			}
+		}
 
-	// You will have to modify this function.
-	return "", 0, ""
+		// ErrWrongLeader or RPC failure, try the next server
+		ck.leader = (ck.leader + 1) % len(ck.servers)
+
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // Put updates key with value only if the version in the
@@ -59,5 +79,40 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
-	return ""
+	sent := false
+	for {
+		args := rpc.PutArgs{Key: key, Value: value, Version: version}
+		reply := rpc.PutReply{}
+		ok := ck.clnt.Call(ck.servers[ck.leader], "KVServer.Put", &args, &reply)
+		if ok {
+			switch reply.Err {
+			case rpc.OK:
+				return rpc.OK
+			case rpc.ErrVersion:
+				if sent {
+					// Return ErrMaybe
+					// ErrMaybe 说明可能已经被他人修改过了，或者说是之前 Put 成功但是未能收到响应
+					return rpc.ErrMaybe
+				} else {
+					// Directly return ErrVersion
+					return rpc.ErrVersion
+				}
+			case rpc.ErrNoKey:
+				return rpc.ErrNoKey
+			case rpc.ErrWrongLeader:
+				// println("Put failed, errWrongLeader, try next server", ck.leader)
+			default:
+				println("Put failed, try next server", ck.leader, reply.Err)
+			}
+		}
+
+		// ErrWrongLeader or RPC failure, try the next server
+		ck.leader = (ck.leader + 1) % len(ck.servers)
+
+		if !ok {
+			sent = true
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
 }

@@ -85,7 +85,7 @@ func (rf *Raft) getLogLocked(index int) LogEntry {
 		return LogEntry{Term: rf.lastIncludeTerm}
 	}
 	if index <= rf.lastIncludeIndex || index >= rf.logEndLocked() {
-		println("Server", rf.me, "getLogLocked: index out of bounds, lastIncludeIndex:", rf.lastIncludeIndex, "logEnd:", rf.logEndLocked(), "requested index:", index)
+		// println("Server", rf.me, "getLogLocked: index out of bounds, lastIncludeIndex:", rf.lastIncludeIndex, "logEnd:", rf.logEndLocked(), "requested index:", index)
 		panic("getLogLocked: index out of bounds")
 	}
 	return rf.log[rf.logIdx(index)]
@@ -180,14 +180,14 @@ func (rf *Raft) readPersist(data []byte) {
 		d.Decode(&log) != nil ||
 		d.Decode(&lastIncludeIndex) != nil ||
 		d.Decode(&lastIncludeTerm) != nil {
-		println("Server", rf.me, "failed to read persisted state")
+		// println("Server", rf.me, "failed to read persisted state")
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
 		rf.lastIncludeIndex = lastIncludeIndex
 		rf.lastIncludeTerm = lastIncludeTerm
-		println("Server", rf.me, "read persisted state: term", rf.currentTerm, "votedFor", rf.votedFor, "log length", rf.logEndLocked())
+		// println("Server", rf.me, "read persisted state: term", rf.currentTerm, "votedFor", rf.votedFor, "log length", rf.logEndLocked())
 	}
 }
 
@@ -200,7 +200,7 @@ func (rf *Raft) PersistBytes() int {
 
 func (rf *Raft) BecomeLeaderLocked() {
 	rf.state = Leader
-	println("Server", rf.me, "became leader for term", rf.currentTerm)
+	// println("Server", rf.me, "became leader for term", rf.currentTerm)
 
 	// Initialize nextIndex and matchIndex for each follower
 	for i := 0; i < len(rf.peers); i++ {
@@ -221,7 +221,7 @@ func (rf *Raft) BecomeFollowerLocked(term int) {
 	rf.currentTerm = term
 	rf.votedFor = -1
 	rf.persistLocked()
-	println("Server", rf.me, "became follower for term", rf.currentTerm)
+	// println("Server", rf.me, "became follower for term", rf.currentTerm)
 }
 
 // the service says it has created a snapshot that has
@@ -239,7 +239,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 
 	if index > rf.logEndLocked()-1 {
-		println("Server", rf.me, "received Snapshot for index", index, "but log length is only", rf.logEndLocked())
+		// println("Server", rf.me, "received Snapshot for index", index, "but log length is only", rf.logEndLocked())
 		return
 	}
 
@@ -250,7 +250,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.lastIncludeIndex = index
 	rf.lastIncludeTerm = lastIncludeTerm
 
-	println("Server", rf.me, "created snapshot up to index", index, "term", rf.lastIncludeTerm, "log length after trim", rf.logEndLocked())
+	// println("Server", rf.me, "created snapshot up to index", index, "term", rf.lastIncludeTerm, "log length after trim", rf.logEndLocked())
 
 	rf.persistLocked()
 }
@@ -330,7 +330,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	rf.persistLocked()
 
-	println("Server", rf.me, "installed snapshot from leader", args.LeaderId, "up to index", rf.lastIncludeIndex, "term", rf.lastIncludeTerm, "log length after trim", rf.logEndLocked())
+	// println("Server", rf.me, "installed snapshot from leader", args.LeaderId, "up to index", rf.lastIncludeIndex, "term", rf.lastIncludeTerm, "log length after trim", rf.logEndLocked())
 
 	// Let applier deliver it, so that it can't be reordered with applied entries
 	if deliver {
@@ -506,7 +506,7 @@ func (rf *Raft) applier() {
 		for _, applyMsg := range entries {
 			rf.applyCh <- applyMsg
 		}
-		println("Server", rf.me, "applied", len(entries), "log entries")
+		// println("Server", rf.me, "applied", len(entries), "log entries")
 	}
 }
 
@@ -522,7 +522,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		println("Server", rf.me, "rejected AppendEntries RPC from leader", args.LeaderId, "for term", args.Term, "due to stale term")
+		// println("Server", rf.me, "rejected AppendEntries RPC from leader", args.LeaderId, "for term", args.Term, "due to stale term")
 		return
 	}
 
@@ -571,7 +571,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.ConflictTerm = conflictTerm
 			reply.ConflictIndex = conflictIndex
 		}
-		println("Server", rf.me, "rejected AppendEntries RPC from leader", args.LeaderId, "for term", args.Term, "due to log inconsistency at PrevLogIndex", args.PrevLogIndex)
+		// println("Server", rf.me, "rejected AppendEntries RPC from leader", args.LeaderId, "for term", args.Term, "due to log inconsistency at PrevLogIndex", args.PrevLogIndex)
 		return
 	}
 
@@ -580,7 +580,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if len(entries) > 0 {
 		rf.addLogLocked(entries, prevLogIndex+1)
-		println("Server", rf.me, "added", len(entries), "log entries [", prevLogIndex+1, "-", prevLogIndex+len(entries), "] from leader", args.LeaderId, "for term", args.Term)
+		// println("Server", rf.me, "added", len(entries), "log entries [", prevLogIndex+1, "-", prevLogIndex+len(entries), "] from leader", args.LeaderId, "for term", args.Term)
 	} else {
 		// println("Server", rf.me, "received heartbeat from leader", args.LeaderId, "for term", args.Term)
 	}
@@ -659,7 +659,7 @@ func (rf *Raft) sendAppendEntriesToServer(server int) {
 	if reply.Success {
 		if rf.matchIndex[server] < args.PrevLogIndex+len(args.Entries) {
 			rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
-			println("Server", rf.me, "updated matchIndex for server", server, "to", rf.matchIndex[server])
+			// println("Server", rf.me, "updated matchIndex for server", server, "to", rf.matchIndex[server])
 		}
 
 		// Check if the log entry has been committed by a majority of servers
@@ -715,7 +715,7 @@ func (rf *Raft) sendAppendEntriesToServer(server int) {
 				rf.nextIndex[server] = reply.ConflictIndex
 			}
 		}
-		println("Server", rf.me, "decremented nextIndex for server", server, "to", rf.nextIndex[server])
+		// println("Server", rf.me, "decremented nextIndex for server", server, "to", rf.nextIndex[server])
 	}
 }
 
@@ -738,7 +738,7 @@ func (rf *Raft) sendInstallSnapshotToServer(server int) {
 
 	ok := rf.sendInstallSnapshot(server, args, reply)
 	if !ok {
-		println("Server", rf.me, "failed to send InstallSnapshot RPC to server", server)
+		// println("Server", rf.me, "failed to send InstallSnapshot RPC to server", server)
 		return
 	}
 
@@ -756,7 +756,7 @@ func (rf *Raft) sendInstallSnapshotToServer(server int) {
 
 	rf.nextIndex[server] = max(rf.nextIndex[server], args.LastIncludedIndex+1)
 	rf.matchIndex[server] = max(rf.matchIndex[server], args.LastIncludedIndex)
-	println("Server", rf.me, "updated nextIndex and matchIndex for server", server, "after InstallSnapshot RPC to", rf.nextIndex[server], rf.matchIndex[server])
+	// println("Server", rf.me, "updated nextIndex and matchIndex for server", server, "after InstallSnapshot RPC to", rf.nextIndex[server], rf.matchIndex[server])
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -850,10 +850,10 @@ func (rf *Raft) sendRequestVoteToServer(server int, candidateId int, term int, l
 			// Become leader
 			rf.BecomeLeaderLocked()
 		} else {
-			println("Server", rf.me, "received vote from server", server, "for term", args.Term, "total votes:", rf.votes)
+			// println("Server", rf.me, "received vote from server", server, "for term", args.Term, "total votes:", rf.votes)
 		}
 	} else {
-		println("Server", rf.me, "was rejected from server", server, "for term", args.Term)
+		// println("Server", rf.me, "was rejected from server", server, "for term", args.Term)
 	}
 }
 
@@ -919,13 +919,13 @@ func (rf *Raft) restore() {
 		rf.lastApplied = rf.lastIncludeIndex
 		rf.commitIndex = rf.lastIncludeIndex
 
-		println("Server", rf.me, "restored state: term", rf.currentTerm, "votedFor", rf.votedFor, "log length", rf.logEndLocked(), "lastIncludeIndex", rf.lastIncludeIndex, "lastIncludeTerm", rf.lastIncludeTerm)
+		// println("Server", rf.me, "restored state: term", rf.currentTerm, "votedFor", rf.votedFor, "log length", rf.logEndLocked(), "lastIncludeIndex", rf.lastIncludeIndex, "lastIncludeTerm", rf.lastIncludeTerm)
 	}
 
 	if rf.persister.SnapshotSize() != 0 {
 		rf.snapshot = rf.persister.ReadSnapshot()
 
-		println("Server", rf.me, "restored snapshot: lastIncludeIndex", rf.lastIncludeIndex, "lastIncludeTerm", rf.lastIncludeTerm)
+		// println("Server", rf.me, "restored snapshot: lastIncludeIndex", rf.lastIncludeIndex, "lastIncludeTerm", rf.lastIncludeTerm)
 	}
 }
 

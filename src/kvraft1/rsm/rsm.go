@@ -2,21 +2,26 @@ package rsm
 
 import (
 	"sync"
+	"time"
+
+	"github.com/google/uuid"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
-	"6.5840/raft1"
+	raft "6.5840/raft1"
 	"6.5840/raftapi"
-	"6.5840/tester1"
-
+	tester "6.5840/tester1"
 )
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-}
 
+	Me  int
+	Id  uuid.UUID
+	Req any
+}
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
 // MakeRSM and must implement the StateMachine interface.  This
@@ -38,6 +43,9 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
+
+	pending     map[uuid.UUID]chan any
+	lastApplied int
 }
 
 // servers[] contains the ports of the set of
@@ -61,10 +69,15 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
+		pending:      make(map[uuid.UUID]chan any),
 	}
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+
+	go rsm.listenApplyCh()
+	go rsm.watchSnapshot()
+
 	return rsm
 }
 
@@ -72,6 +85,54 @@ func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
 }
 
+func (rsm *RSM) listenApplyCh() {
+	for msg := range rsm.applyCh {
+		if msg.CommandValid {
+			op := msg.Command.(Op)
+			rep := rsm.sm.DoOp(op.Req)
+
+			rsm.mu.Lock()
+			ch, ok := rsm.pending[op.Id]
+			if ok {
+				ch <- rep
+			} else {
+				// println("pending not found", op.Id.String())
+			}
+
+			rsm.lastApplied = max(rsm.lastApplied, msg.CommandIndex)
+			rsm.mu.Unlock()
+		} else if msg.SnapshotValid {
+			rsm.applySnapshot(msg.Snapshot)
+		}
+	}
+}
+
+func (rsm *RSM) applySnapshot(snapshot []byte) {
+	rsm.mu.Lock()
+	defer rsm.mu.Unlock()
+
+	rsm.sm.Restore(snapshot)
+}
+
+func (rsm *RSM) watchSnapshot() {
+	for {
+		time.Sleep(100 * time.Millisecond)
+
+		if rsm.maxraftstate == -1 {
+			continue
+		}
+
+		if rsm.rf.PersistBytes() > rsm.maxraftstate {
+			snapshot := rsm.sm.Snapshot()
+
+			rsm.mu.Lock()
+			lastApplied := rsm.lastApplied
+			rsm.mu.Unlock()
+
+			rsm.rf.Snapshot(lastApplied, snapshot)
+		}
+	}
+}
 
 // Submit a command to Raft, and wait for it to be committed.  It
 // should return ErrWrongLeader if client should find new leader and
@@ -83,5 +144,48 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// is the argument to Submit and id is a unique id for the op.
 
 	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+
+	op := Op{
+		Me:  rsm.me,
+		Id:  uuid.New(),
+		Req: req,
+	}
+
+	_, term, isLeader := rsm.Raft().Start(op)
+
+	if !isLeader {
+		return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	}
+
+	rsm.mu.Lock()
+	ch := make(chan any, 1)
+	rsm.pending[op.Id] = ch
+
+	defer func() {
+		rsm.mu.Lock()
+		delete(rsm.pending, op.Id)
+		rsm.mu.Unlock()
+	}()
+
+	// println("add pending", op.Id.String())
+	rsm.mu.Unlock()
+
+	for {
+		select {
+		case rep := <-ch:
+			// println("submited op", op.Id.String())
+			return rpc.OK, rep
+		case <-time.After(500 * time.Millisecond):
+			stateTerm, stateIsLeader := rsm.rf.GetState()
+			// If leader changed, return ErrWrongLeader to client so it can try another server.
+			// ! As figure 8, if the leader has become a follower, term changed, then it become leader again
+			// ! All not commited log with old term will wait one current term log to commit
+			// ! Without NOP, if the test has no new log to commit, this submit will wait forever
+			// ! So we need to check both term and isLeader by 'and' but not 'or'. Once term changed will trigger failed
+			if stateTerm != term || !stateIsLeader {
+				// println("submited op", op.Id.String(), "failed")
+				return rpc.ErrWrongLeader, nil
+			}
+		}
+	}
 }

@@ -5,13 +5,12 @@ package shardctrler
 //
 
 import (
-
-	"6.5840/kvsrv1"
-	"6.5840/kvtest1"
+	kvsrv "6.5840/kvsrv1"
+	"6.5840/kvsrv1/rpc"
+	kvtest "6.5840/kvtest1"
 	"6.5840/shardkv1/shardcfg"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
-
 
 // ShardCtrler for the controller and kv clerk.
 type ShardCtrler struct {
@@ -44,7 +43,11 @@ func (sck *ShardCtrler) InitController() {
 // pick the key to name the configuration.  The initial configuration
 // lists shardgrp shardcfg.Gid1 for all shards.
 func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
-	// Your code here
+	// put in kvsrv at version 0
+	err := sck.IKVClerk.Put("config", cfg.String(), 0)
+	if err != rpc.OK {
+		panic("InitConfig: failed to put initial config in kvsrv")
+	}
 }
 
 // Called by the tester to ask the controller to change the
@@ -55,10 +58,13 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 	// Your code here.
 }
 
-
 // Return the current configuration
 func (sck *ShardCtrler) Query() *shardcfg.ShardConfig {
 	// Your code here.
-	return nil
+	s, _, err := sck.IKVClerk.Get("config")
+	if err != rpc.OK {
+		panic("Query: failed to get current config from kvsrv")
+	}
+	// unmarshal the string into a ShardConfig
+	return shardcfg.FromString(s)
 }
-

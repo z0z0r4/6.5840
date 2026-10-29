@@ -1,10 +1,6 @@
 package lock
 
 import (
-<<<<<<< HEAD
-	"fmt"
-=======
->>>>>>> 7b002c8 (feat: kvsrv1/lock)
 	"time"
 
 	"6.5840/kvsrv1/rpc"

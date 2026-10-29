@@ -18,6 +18,7 @@ const (
 	// ShardKV specific errors
 	ErrShardNotReady = "ErrShardNotReady"
 	ErrOldConfig     = "ErrOldConfig"
+	ErrDuplicateOp   = "ErrDuplicateOp"
 )
 
 type Tversion uint64

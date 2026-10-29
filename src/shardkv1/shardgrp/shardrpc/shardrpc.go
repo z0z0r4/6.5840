@@ -11,9 +11,20 @@ type FreezeShardArgs struct {
 }
 
 type FreezeShardReply struct {
-	State []byte
-	Num   shardcfg.Tnum
-	Err   rpc.Err
+	// State []byte
+	Num shardcfg.Tnum
+	Err rpc.Err
+}
+
+type GetShardArgs struct {
+	Shard shardcfg.Tshid
+}
+
+type GetShardReply struct {
+	Err    rpc.Err
+	State  []byte
+	Owned  bool
+	Frozen bool
 }
 
 type InstallShardArgs struct {

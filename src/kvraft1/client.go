@@ -13,11 +13,13 @@ type Clerk struct {
 	servers []string
 	leader  int // last successful leader (index into servers[])
 	misses  int // servers tried without success since the last success
+
+	clientId int64
+	seq      int64 // Seq of the last Put
 }
 
 func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
-	ck := &Clerk{clnt: clnt, servers: servers}
-	// You'll have to add code here.
+	ck := &Clerk{clnt: clnt, servers: servers, clientId: rpc.NewClientId()}
 	return ck
 }
 
@@ -72,45 +74,24 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 
 // Put updates key with value only if the version in the
 // request matches the version of the key at the server.  If the
-// versions numbers don't match, the server should return
-// ErrVersion.  If Put receives an ErrVersion on its first RPC, Put
-// should return ErrVersion, since the Put was definitely not
-// performed at the server. If the server returns ErrVersion on a
-// resend RPC, then Put must return ErrMaybe to the application, since
-// its earlier RPC might have been processed by the server successfully
-// but the response was lost, and the the Clerk doesn't know if
-// the Put was performed or not.
+// versions numbers don't match, the server returns ErrVersion.
 //
-// You can send an RPC to server i with code like this:
-// ok := ck.clnt.Call(ck.servers[i], "KVServer.Put", &args, &reply)
-//
-// The types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. Additionally, reply must be passed as a pointer.
+// Put has exactly-once semantics: every resend, to any server, carries
+// the same (clientId, Seq), and the servers execute only the first copy
+// that commits and answer later copies with its result. So the reply to
+// a resend is the real outcome, and Put never returns ErrMaybe.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	defer func() { ck.misses = 0 }()
-	sent := false
+	ck.seq++
+	args := rpc.PutArgs{Key: key, Value: value, Version: version, ClientId: ck.clientId, Seq: ck.seq}
 	for {
-		args := rpc.PutArgs{Key: key, Value: value, Version: version}
 		reply := rpc.PutReply{}
 		ok := ck.clnt.Call(ck.servers[ck.leader], "KVServer.Put", &args, &reply)
 		if ok {
 			switch reply.Err {
-			case rpc.OK:
-				return rpc.OK
-			case rpc.ErrVersion:
-				if sent {
-					// Return ErrMaybe
-					// ErrMaybe 说明可能已经被他人修改过了，或者说是之前 Put 成功但是未能收到响应
-					return rpc.ErrMaybe
-				} else {
-					// Directly return ErrVersion
-					return rpc.ErrVersion
-				}
-			case rpc.ErrNoKey:
-				return rpc.ErrNoKey
+			case rpc.OK, rpc.ErrVersion, rpc.ErrNoKey:
+				return reply.Err
 			case rpc.ErrWrongLeader:
-				// println("Put failed, errWrongLeader, try next server", ck.leader)
 			default:
 				println("Put failed, try next server", ck.leader, reply.Err)
 			}
@@ -118,9 +99,5 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 
 		// ErrWrongLeader or RPC failure, try the next server
 		ck.nextServer()
-
-		// Even an ErrWrongLeader reply may come from a server that already
-		// appended the Put to its log, and that entry can still commit.
-		sent = true
 	}
 }

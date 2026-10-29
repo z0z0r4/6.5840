@@ -46,6 +46,13 @@ type RSM struct {
 
 	pending     map[uuid.UUID]chan any
 	lastApplied int
+	appliedCond *sync.Cond // signaled when lastApplied advances
+}
+
+// Implemented by a Raft that supports leader leases (raft1 does).
+type leaseRaft interface {
+	SetLease(d time.Duration)
+	LeaseRead() (int, bool)
 }
 
 // servers[] contains the ports of the set of
@@ -71,6 +78,7 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		sm:           sm,
 		pending:      make(map[uuid.UUID]chan any),
 	}
+	rsm.appliedCond = sync.NewCond(&rsm.mu)
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
@@ -102,6 +110,7 @@ func (rsm *RSM) listenApplyCh() {
 			}
 
 			rsm.lastApplied = max(rsm.lastApplied, msg.CommandIndex)
+			rsm.appliedCond.Broadcast()
 			rsm.mu.Unlock()
 		} else if msg.SnapshotValid {
 			rsm.applySnapshot(msg.Snapshot, msg.SnapshotIndex)
@@ -115,6 +124,7 @@ func (rsm *RSM) applySnapshot(snapshot []byte, index int) {
 
 	rsm.sm.Restore(snapshot)
 	rsm.lastApplied = max(rsm.lastApplied, index)
+	rsm.appliedCond.Broadcast()
 }
 
 func (rsm *RSM) watchSnapshot() {
@@ -191,4 +201,41 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 			}
 		}
 	}
+}
+
+// EnableLeaseReads lets Read serve read-only requests from the local
+// state while this peer is a leader holding a lease of duration d.
+func (rsm *RSM) EnableLeaseReads(d time.Duration) {
+	if lr, ok := rsm.rf.(leaseRaft); ok {
+		lr.SetLease(d)
+	}
+}
+
+// Read executes a read-only request. If this peer is the leader and
+// holds a lease, it executes req against the local state once that
+// state includes every committed entry, without a round through the
+// log. Otherwise it falls back to Submit.
+//
+// req must not modify the state machine.
+func (rsm *RSM) Read(req any) (rpc.Err, any) {
+	lr, ok := rsm.rf.(leaseRaft)
+	if !ok {
+		return rsm.Submit(req)
+	}
+	index, ok := lr.LeaseRead()
+	if !ok {
+		return rsm.Submit(req)
+	}
+
+	rsm.mu.Lock()
+	for rsm.lastApplied < index {
+		rsm.appliedCond.Wait()
+	}
+	rsm.mu.Unlock()
+
+	// Every entry up to index committed before LeaseRead returned, and no
+	// entry after index committed before then. Executing req now sees the
+	// state at some applied index >= index, which is the latest committed
+	// state at the moment that entry committed, a moment inside this call.
+	return rpc.OK, rsm.sm.DoOp(req)
 }

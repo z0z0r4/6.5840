@@ -3,6 +3,7 @@ package kvraft
 import (
 	"bytes"
 	"sync"
+	"time"
 
 	"6.5840/kvraft1/rsm"
 	"6.5840/kvsrv1/rpc"
@@ -10,6 +11,11 @@ import (
 	"6.5840/labrpc"
 	tester "6.5840/tester1"
 )
+
+// How long a leader's lease lasts after a majority acknowledged it. A
+// leader serves Gets from its own state while it holds a lease, and a
+// new leader waits this long before it commits anything.
+const LeaseDuration = 500 * time.Millisecond
 
 type KVServer struct {
 	me  int
@@ -104,11 +110,9 @@ func (kv *KVServer) Restore(data []byte) {
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
-	// Your code here. Use kv.rsm.Submit() to submit args
-	// You can use go's type casts to turn the any return value
-	// of Submit() into a GetReply: rep.(rpc.GetReply)
-
-	err, rep := kv.rsm.Submit(*args)
+	// A Get doesn't modify the state, so a leader holding a lease can
+	// serve it without going through the log.
+	err, rep := kv.rsm.Read(*args)
 	reply.Err = err
 
 	if err == rpc.OK {
@@ -143,7 +147,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	kv.kvStore = make(map[string]ValueVersion)
 	kv.lastPut = make(map[int64]rpc.Seen)
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
-	// You may need initialization code here.
+	if !tester.NoLeaseReads {
+		kv.rsm.EnableLeaseReads(LeaseDuration)
+	}
 	return []any{kv, kv.rsm.Raft()}
 }
 

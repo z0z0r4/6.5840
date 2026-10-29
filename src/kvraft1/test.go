@@ -28,6 +28,12 @@ type Test struct {
 }
 
 func MakeTest(t *testing.T, part string, nclients, nservers int, reliable bool, crash bool, partitions bool, maxraftstate int, randomkeys bool) *Test {
+	return makeTestArgs(t, part, nclients, nservers, reliable, crash, partitions, maxraftstate, randomkeys, nil)
+}
+
+// makeTestArgs is MakeTest with extra command-line arguments for the
+// server daemons (e.g., --no-lease-reads).
+func makeTestArgs(t *testing.T, part string, nclients, nservers int, reliable bool, crash bool, partitions bool, maxraftstate int, randomkeys bool, extra []string) *Test {
 	ts := &Test{
 		t:            t,
 		part:         part,
@@ -39,6 +45,7 @@ func MakeTest(t *testing.T, part string, nclients, nservers int, reliable bool, 
 		randomkeys:   randomkeys,
 	}
 	args := []string{fmt.Sprintf("--max-raft-state=%d", maxraftstate)}
+	args = append(args, extra...)
 	cfg := tester.MakeConfig(t, nservers, reliable, "kvraft1d", args)
 	ts.Test = kvtest.MakeTest(t, cfg, randomkeys, ts)
 	ts.Begin(ts.makeTitle())

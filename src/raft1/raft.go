@@ -327,6 +327,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	deliver := args.LastIncludedIndex > rf.lastApplied
 
 	rf.lastApplied = max(rf.lastApplied, args.LastIncludedIndex)
+	// Everything in a snapshot is committed
+	rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
 
 	rf.persistLocked()
 

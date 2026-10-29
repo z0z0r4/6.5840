@@ -253,7 +253,6 @@ func (kv *KVServer) DoOp(req any) any {
 }
 
 func (kv *KVServer) Snapshot() []byte {
-	// Your code here
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
@@ -261,20 +260,20 @@ func (kv *KVServer) Snapshot() []byte {
 	e := labgob.NewEncoder(w)
 
 	e.Encode(kv.kvStore)
-	// e.Encode(kv.shardsFrozen)
-	// e.Encode(kv.ownedShards)
+	e.Encode(kv.configNum)
+	e.Encode(kv.shards)
 	return w.Bytes()
 }
 
 func (kv *KVServer) Restore(data []byte) {
-	// Your code here
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
 	r := bytes.NewReader(data)
 	d := labgob.NewDecoder(r)
 	d.Decode(&kv.kvStore)
-	// d.Decode(kv.shardsFrozen)
+	d.Decode(&kv.configNum)
+	d.Decode(&kv.shards)
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
@@ -349,24 +348,22 @@ func StartServerShardGrp(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, p
 	labgob.Register(rsm.Op{})
 
 	kv := &KVServer{gid: gid, me: me}
-	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
-
 	kv.kvStore = make(map[shardcfg.Tshid]map[string]ValueVersion)
 	for i := 0; i < shardcfg.NShards; i++ {
 		kv.kvStore[shardcfg.Tshid(i)] = make(map[string]ValueVersion)
 	}
-
 	kv.shards = make(map[shardcfg.Tshid]*Shrad)
 	for i := 0; i < shardcfg.NShards; i++ {
 		kv.shards[shardcfg.Tshid(i)] = &Shrad{owned: false, frozen: false}
 	}
-
 	if kv.gid == 1 {
 		// Own all shards initially
 		for i := 0; i < shardcfg.NShards; i++ {
 			kv.shards[shardcfg.Tshid(i)].owned = true
 		}
 	}
+
+	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 
 	return []any{kv, kv.rsm.Raft()}
 }

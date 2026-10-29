@@ -200,8 +200,9 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 	}
 
 	next_config, nv, nerr := sck.get_config("next_config")
-
-	if nerr == rpc.ErrNoKey || nerr == rpc.OK {
+	if nerr == rpc.OK && next_config.Num >= new.Num {
+		return
+	} else if nerr == rpc.ErrNoKey || nerr == rpc.OK && next_config.Num < new.Num {
 		put_success := sck.put_config("next_config", new, nv)
 		if !put_success {
 			return
@@ -230,6 +231,5 @@ func (sck *ShardCtrler) Query() *shardcfg.ShardConfig {
 	if err != rpc.OK {
 		panic("Query: failed to get current config from kvsrv")
 	}
-	// unmarshal the string into a ShardConfig
 	return s
 }

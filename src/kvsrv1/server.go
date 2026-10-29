@@ -21,11 +21,16 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 type KVServer struct {
 	mu      sync.Mutex
 	kvStore map[string]ValueVersion
+
+	// The last Put executed for each clerk, to answer resent Puts
+	// without executing them a second time.
+	lastPut map[int64]rpc.Seen
 }
 
 func MakeKVServer() *KVServer {
 	kv := &KVServer{}
 	kv.kvStore = make(map[string]ValueVersion)
+	kv.lastPut = make(map[int64]rpc.Seen)
 	return kv
 }
 
@@ -52,6 +57,19 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	// fmt.Printf("Put %s with version %d\n", args.Key, args.Version)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
+
+	if args.ClientId != 0 {
+		if seen, ok := kv.lastPut[args.ClientId]; ok && args.Seq <= seen.Seq {
+			// A resend of a Put we already executed. A clerk has at most
+			// one Put outstanding, so an older Seq is a stale resend
+			// whose reply nobody waits for.
+			reply.Err = seen.Err
+			return
+		}
+		defer func() {
+			kv.lastPut[args.ClientId] = rpc.Seen{Seq: args.Seq, Err: reply.Err}
+		}()
+	}
 
 	if vv, ok := kv.kvStore[args.Key]; ok {
 		if vv.Version == args.Version {

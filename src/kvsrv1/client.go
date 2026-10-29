@@ -11,11 +11,13 @@ import (
 type Clerk struct {
 	clnt   *tester.Clnt
 	server string
+
+	clientId int64
+	seq      int64 // Seq of the last Put
 }
 
 func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
-	ck := &Clerk{clnt: clnt, server: server}
-	// You may add code here.
+	ck := &Clerk{clnt: clnt, server: server, clientId: rpc.NewClientId()}
 	return ck
 }
 
@@ -46,46 +48,21 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 
 // Put updates key with value only if the version in the
 // request matches the version of the key at the server.  If the
-// versions numbers don't match, the server should return
-// ErrVersion.  If Put receives an ErrVersion on its first RPC, Put
-// should return ErrVersion, since the Put was definitely not
-// performed at the server. If the server returns ErrVersion on a
-// resend RPC, then Put must return ErrMaybe to the application, since
-// its earlier RPC might have been processed by the server successfully
-// but the response was lost, and the Clerk doesn't know if
-// the Put was performed or not.
+// versions numbers don't match, the server returns ErrVersion.
 //
-// You can send an RPC with code like this:
-// ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
-//
-// The types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. Additionally, reply must be passed as a pointer.
+// Put has exactly-once semantics: every resend carries the same
+// (clientId, Seq), so the server executes the Put at most once and
+// answers resends with the result of that execution. Put therefore
+// never needs to return ErrMaybe.
 func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
-	first_retry := true
+	ck.seq++
+	args := rpc.PutArgs{Key: key, Value: value, Version: version, ClientId: ck.clientId, Seq: ck.seq}
 	for {
-		args := rpc.PutArgs{Key: key, Value: value, Version: version}
 		reply := rpc.PutReply{}
 		ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
-		if ok && reply.Err == rpc.OK {
+		if ok {
 			return reply.Err
-		} else if ok {
-			switch reply.Err {
-			case rpc.ErrVersion:
-				if first_retry {
-					// Directly return ErrVersion
-					return reply.Err
-				} else {
-					// Return ErrMaybe
-					// ErrMaybe 说明可能已经被他人修改过了，或者说是之前 Put 成功但是未能收到响应
-					return rpc.ErrMaybe
-				}
-			case rpc.ErrNoKey:
-				return reply.Err
-			}
 		}
-
-		first_retry = false
 
 		time.Sleep(100 * time.Millisecond)
 	}

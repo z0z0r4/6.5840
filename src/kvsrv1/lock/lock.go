@@ -59,26 +59,23 @@ func (lk *Lock) Acquire() {
 }
 
 func (lk *Lock) Release() {
-	received_errmaybe := false
 	for {
 		s, v, err := lk.ck.Get(lk.name)
 		if err == rpc.OK {
-			if s == "unlocked" && received_errmaybe {
-				// If we received an ErrMaybe, then we may have already released the lock, then we can return.
+			if s != lk.caller_id+"-locked" {
+				// We held the lock, so an earlier Put that returned ErrMaybe
+				// did release it, and another client may have acquired it
+				// since: don't wait for "unlocked".
 				return
 			}
 
-			if s == lk.caller_id+"-locked" {
-				// Set unlocked
-				put_err := lk.ck.Put(lk.name, "unlocked", v)
-				if put_err == rpc.OK {
-					return
-				} else if put_err == rpc.ErrMaybe {
-					received_errmaybe = true
-				}
-
-				// fmt.Printf("Release: Caller %s Put Error: %v\n", lk.caller_id, put_err)
+			// Set unlocked
+			put_err := lk.ck.Put(lk.name, "unlocked", v)
+			if put_err == rpc.OK {
+				return
 			}
+
+			// fmt.Printf("Release: Caller %s Put Error: %v\n", lk.caller_id, put_err)
 		}
 
 		// fmt.Printf("Release: Caller %s Get Error: %v, s: %v, v: %v\n", lk.caller_id, err, s, v)

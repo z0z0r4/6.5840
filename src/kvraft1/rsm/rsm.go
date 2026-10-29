@@ -89,9 +89,11 @@ func (rsm *RSM) listenApplyCh() {
 	for msg := range rsm.applyCh {
 		if msg.CommandValid {
 			op := msg.Command.(Op)
-			rep := rsm.sm.DoOp(op.Req)
 
+			// Apply under rsm.mu, so that watchSnapshot sees the state
+			// and lastApplied of the same moment.
 			rsm.mu.Lock()
+			rep := rsm.sm.DoOp(op.Req)
 			ch, ok := rsm.pending[op.Id]
 			if ok {
 				ch <- rep
@@ -123,9 +125,8 @@ func (rsm *RSM) watchSnapshot() {
 		}
 
 		if rsm.rf.PersistBytes() > rsm.maxraftstate {
-			snapshot := rsm.sm.Snapshot()
-
 			rsm.mu.Lock()
+			snapshot := rsm.sm.Snapshot()
 			lastApplied := rsm.lastApplied
 			rsm.mu.Unlock()
 
@@ -151,15 +152,13 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 		Req: req,
 	}
 
-	_, term, isLeader := rsm.Raft().Start(op)
-
-	if !isLeader {
-		return rpc.ErrWrongLeader, nil // i'm dead, try another server.
-	}
-
-	rsm.mu.Lock()
+	// Register before Start: the entry may commit and be applied before
+	// Start even returns, and listenApplyCh drops the result of an op
+	// nobody is waiting for.
 	ch := make(chan any, 1)
+	rsm.mu.Lock()
 	rsm.pending[op.Id] = ch
+	rsm.mu.Unlock()
 
 	defer func() {
 		rsm.mu.Lock()
@@ -167,8 +166,11 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 		rsm.mu.Unlock()
 	}()
 
-	// println("add pending", op.Id.String())
-	rsm.mu.Unlock()
+	_, term, isLeader := rsm.Raft().Start(op)
+
+	if !isLeader {
+		return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	}
 
 	for {
 		select {

@@ -18,6 +18,10 @@ type KVServer struct {
 	// Your definitions here.
 	mu      sync.Mutex
 	kvStore map[string]ValueVersion
+
+	// The last Put executed for each clerk. Resends of a Put can end up
+	// in the log more than once; only the first one is executed.
+	lastPut map[int64]rpc.Seen
 }
 
 type ValueVersion struct {
@@ -44,6 +48,9 @@ func (kv *KVServer) DoOp(req any) any {
 		}
 	} else if args, ok := req.(rpc.PutArgs); ok {
 		// println("DoOp: Put", args.Key, "with version", args.Version)
+		if seen, ok := kv.lastPut[args.ClientId]; args.ClientId != 0 && ok && args.Seq <= seen.Seq {
+			return rpc.PutReply{Err: seen.Err}
+		}
 		if vv, ok := kv.kvStore[args.Key]; ok {
 			if vv.Version == args.Version {
 				kv.kvStore[args.Key] = ValueVersion{Value: args.Value, Version: args.Version + 1}
@@ -56,6 +63,9 @@ func (kv *KVServer) DoOp(req any) any {
 			rep = rpc.PutReply{Err: rpc.OK}
 		} else {
 			rep = rpc.PutReply{Err: rpc.ErrNoKey}
+		}
+		if args.ClientId != 0 {
+			kv.lastPut[args.ClientId] = rpc.Seen{Seq: args.Seq, Err: rep.(rpc.PutReply).Err}
 		}
 	} else {
 		// print type
@@ -73,6 +83,7 @@ func (kv *KVServer) Snapshot() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.kvStore)
+	e.Encode(kv.lastPut)
 	return w.Bytes()
 }
 
@@ -83,7 +94,13 @@ func (kv *KVServer) Restore(data []byte) {
 
 	r := bytes.NewReader(data)
 	d := labgob.NewDecoder(r)
-	d.Decode(&kv.kvStore)
+	kvStore := make(map[string]ValueVersion)
+	lastPut := make(map[int64]rpc.Seen)
+	if d.Decode(&kvStore) != nil || d.Decode(&lastPut) != nil {
+		panic("Restore: bad snapshot")
+	}
+	kv.kvStore = kvStore
+	kv.lastPut = lastPut
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
@@ -124,6 +141,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	kv := &KVServer{me: me}
 
 	kv.kvStore = make(map[string]ValueVersion)
+	kv.lastPut = make(map[int64]rpc.Seen)
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	// You may need initialization code here.
 	return []any{kv, kv.rsm.Raft()}

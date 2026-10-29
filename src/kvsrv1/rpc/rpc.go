@@ -1,5 +1,10 @@
 package rpc
 
+import (
+	"crypto/rand"
+	"math/big"
+)
+
 type Err string
 
 const (
@@ -27,6 +32,26 @@ type PutArgs struct {
 	Key     string
 	Value   string
 	Version Tversion
+
+	// For exactly-once Puts: a clerk numbers its Puts 1, 2, ... and
+	// resends a Put with the same Seq, so the server can recognize a
+	// duplicate and return the result of the first execution. A zero
+	// ClientId opts out of duplicate detection.
+	ClientId int64
+	Seq      int64
+}
+
+// Seen records the last Put a server executed for one clerk.
+type Seen struct {
+	Seq int64
+	Err Err
+}
+
+// NewClientId returns a random, non-zero clerk identifier.
+func NewClientId() int64 {
+	max := big.NewInt(int64(1) << 62)
+	n, _ := rand.Int(rand.Reader, max)
+	return n.Int64() + 1
 }
 
 type PutReply struct {

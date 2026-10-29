@@ -27,9 +27,22 @@ type KVServer struct {
 	mu      sync.Mutex
 	kvStore map[string]ValueVersion
 
-	// The last Put executed for each clerk. Resends of a Put can end up
-	// in the log more than once; only the first one is executed.
-	lastPut map[uuid.UUID]rpc.Seen
+	// The last Put or Txn executed for each clerk, with its result.
+	// Resends can end up in the log more than once; only the first copy
+	// is executed.
+	lastOp map[uuid.UUID]clientOp
+}
+
+type clientOp struct {
+	Seq    int64
+	PutErr rpc.Err  // if the op was a Put
+	Txn    TxnReply // if the op was a Txn
+}
+
+// Whether a request (clientId, seq) was already executed.
+func (kv *KVServer) seenLocked(clientId uuid.UUID, seq int64) (clientOp, bool) {
+	op, ok := kv.lastOp[clientId]
+	return op, clientId != uuid.Nil && ok && seq <= op.Seq
 }
 
 type ValueVersion struct {
@@ -56,8 +69,8 @@ func (kv *KVServer) DoOp(req any) any {
 		}
 	} else if args, ok := req.(rpc.PutArgs); ok {
 		// println("DoOp: Put", args.Key, "with version", args.Version)
-		if seen, ok := kv.lastPut[args.ClientId]; args.ClientId != uuid.Nil && ok && args.Seq <= seen.Seq {
-			return rpc.PutReply{Err: seen.Err}
+		if seen, ok := kv.seenLocked(args.ClientId, args.Seq); ok {
+			return rpc.PutReply{Err: seen.PutErr}
 		}
 		if vv, ok := kv.kvStore[args.Key]; ok {
 			if vv.Version == args.Version {
@@ -73,8 +86,17 @@ func (kv *KVServer) DoOp(req any) any {
 			rep = rpc.PutReply{Err: rpc.ErrNoKey}
 		}
 		if args.ClientId != uuid.Nil {
-			kv.lastPut[args.ClientId] = rpc.Seen{Seq: args.Seq, Err: rep.(rpc.PutReply).Err}
+			kv.lastOp[args.ClientId] = clientOp{Seq: args.Seq, PutErr: rep.(rpc.PutReply).Err}
 		}
+	} else if args, ok := req.(TxnArgs); ok {
+		if seen, ok := kv.seenLocked(args.ClientId, args.Seq); ok {
+			return seen.Txn
+		}
+		r := kv.doTxnLocked(&args)
+		if args.ClientId != uuid.Nil {
+			kv.lastOp[args.ClientId] = clientOp{Seq: args.Seq, Txn: r}
+		}
+		rep = r
 	} else {
 		// print type
 		println("DoOp: unknown request type")
@@ -91,7 +113,7 @@ func (kv *KVServer) Snapshot() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.kvStore)
-	e.Encode(kv.lastPut)
+	e.Encode(kv.lastOp)
 	return w.Bytes()
 }
 
@@ -103,12 +125,12 @@ func (kv *KVServer) Restore(data []byte) {
 	r := bytes.NewReader(data)
 	d := labgob.NewDecoder(r)
 	kvStore := make(map[string]ValueVersion)
-	lastPut := make(map[uuid.UUID]rpc.Seen)
-	if d.Decode(&kvStore) != nil || d.Decode(&lastPut) != nil {
+	lastOp := make(map[uuid.UUID]clientOp)
+	if d.Decode(&kvStore) != nil || d.Decode(&lastOp) != nil {
 		panic("Restore: bad snapshot")
 	}
 	kv.kvStore = kvStore
-	kv.lastPut = lastPut
+	kv.lastOp = lastOp
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
@@ -135,6 +157,16 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	}
 }
 
+// Txn runs a transaction (see txn.go) as a single entry in the log.
+func (kv *KVServer) Txn(args *TxnArgs, reply *TxnReply) {
+	err, rep := kv.rsm.Submit(*args)
+	reply.Err = err
+
+	if err == rpc.OK {
+		*reply = rep.(TxnReply)
+	}
+}
+
 // StartKVServer() and MakeRSM() must return quickly, so they should
 // start goroutines for any long-running work.
 func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persister *tester.Persister, maxraftstate int) []any {
@@ -143,11 +175,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	labgob.Register(rsm.Op{})
 	labgob.Register(rpc.PutArgs{})
 	labgob.Register(rpc.GetArgs{})
+	labgob.Register(TxnArgs{})
 
 	kv := &KVServer{me: me}
 
 	kv.kvStore = make(map[string]ValueVersion)
-	kv.lastPut = make(map[uuid.UUID]rpc.Seen)
+	kv.lastOp = make(map[uuid.UUID]clientOp)
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	if !tester.NoLeaseReads {
 		kv.rsm.EnableLeaseReads(LeaseDuration)

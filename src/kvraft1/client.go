@@ -103,3 +103,23 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 		ck.nextServer()
 	}
 }
+
+// Txn executes a transaction: if every comparison in cmps holds, it
+// runs the operations in then, otherwise those in els, all atomically.
+// It returns whether then ran, and one result per operation. Like Put,
+// Txn is exactly-once: resends carry the same (clientId, Seq).
+func (ck *Clerk) Txn(cmps []Cmp, then []TxnOp, els []TxnOp) (bool, []OpResult) {
+	defer func() { ck.misses = 0 }()
+	ck.seq++
+	args := TxnArgs{If: cmps, Then: then, Else: els, ClientId: ck.clientId, Seq: ck.seq}
+	for {
+		reply := TxnReply{}
+		ok := ck.clnt.Call(ck.servers[ck.leader], "KVServer.Txn", &args, &reply)
+		if ok && reply.Err == rpc.OK {
+			return reply.Succeeded, reply.Results
+		}
+
+		// ErrWrongLeader or RPC failure, try the next server
+		ck.nextServer()
+	}
+}

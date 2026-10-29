@@ -28,7 +28,11 @@ type Clerk struct {
 
 	// Shard group clerks
 	rcks map[tester.Tgid]*shardgrp.Clerk
-	// You will have to modify this struct.
+
+	// The configuration from the last Query. Querying the controller
+	// is a round through its kvraft group, so the clerk only re-queries
+	// after a shardgrp says it isn't responsible for the key.
+	config *shardcfg.ShardConfig
 }
 
 // The tester calls MakeClerk and passes in a shardctrler so that
@@ -41,7 +45,8 @@ func MakeClerk(clnt *tester.Clnt, sck *shardctrler.ShardCtrler) kvtest.IKVClerk 
 	ck.rcks = make(map[tester.Tgid]*shardgrp.Clerk)
 	// You'll have to add code here.
 	// Init first grp clerk
-	ck.rcks[tester.Tgid(1)] = shardgrp.MakeClerk(clnt, sck.Query().Groups[tester.Tgid(1)])
+	ck.config = sck.Query()
+	ck.rcks[tester.Tgid(1)] = shardgrp.MakeClerk(clnt, ck.config.Groups[tester.Tgid(1)])
 	return ck
 }
 
@@ -56,6 +61,16 @@ func (ck *Clerk) makeGrpClerk(gid tester.Tgid, servers []string) *shardgrp.Clerk
 	return rck
 }
 
+// The clerk for the group that owns key's shard in ck.config.
+func (ck *Clerk) grpClerk(key string) *shardgrp.Clerk {
+	gid := ck.config.Shards[shardcfg.Key2Shard(key)]
+	rck, ok := ck.GetClerk(gid)
+	if !ok {
+		rck = ck.makeGrpClerk(gid, ck.config.Groups[gid])
+	}
+	return rck
+}
+
 // Get a key from a shardgrp.  You can use shardcfg.Key2Shard(key) to
 // find the shard responsible for the key and ck.sck.Query() to read
 // the current configuration and lookup the servers in the group
@@ -64,18 +79,12 @@ func (ck *Clerk) makeGrpClerk(gid tester.Tgid, servers []string) *shardgrp.Clerk
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
 	for {
-		config := ck.sck.Query()
-		shard := shardcfg.Key2Shard(key)
-		gid := config.Shards[shard]
-		rck, ok := ck.GetClerk(gid)
-		if !ok {
-			rck = ck.makeGrpClerk(gid, config.Groups[gid])
-		}
-		value, version, err := rck.Get(key)
+		value, version, err := ck.grpClerk(key).Get(key)
 		if err != rpc.ErrWrongGroup {
 			return value, version, err
 		}
 		time.Sleep(100 * time.Millisecond)
+		ck.config = ck.sck.Query()
 	}
 }
 
@@ -84,14 +93,7 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	// You will have to modify this function.
 	retried := false
 	for {
-		config := ck.sck.Query()
-		shard := shardcfg.Key2Shard(key)
-		gid := config.Shards[shard]
-		rck, ok := ck.GetClerk(gid)
-		if !ok {
-			rck = ck.makeGrpClerk(gid, config.Groups[gid])
-		}
-		err := rck.Put(key, value, version)
+		err := ck.grpClerk(key).Put(key, value, version)
 		if err != rpc.ErrWrongGroup {
 			if err == rpc.ErrVersion && retried {
 				// An earlier attempt at another group may have been applied
@@ -101,5 +103,6 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 		}
 		retried = true
 		time.Sleep(100 * time.Millisecond)
+		ck.config = ck.sck.Query()
 	}
 }

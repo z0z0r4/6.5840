@@ -38,6 +38,7 @@ shardkv: .FORCE check-version shardkv-build
 
 shardkv-build: .FORCE check-version
 	go build $(RACE) -o main/kvsrv1d main/kvsrv1d.go
+	go build $(RACE) -o main/kvraft1d main/kvraft1d.go
 	go build $(RACE) -o main/shardgrp1d main/shardgrp1d.go
 
 mr: .FORCE check-version mr-build

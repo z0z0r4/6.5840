@@ -24,6 +24,7 @@ type InstallShardArgs struct {
 
 type InstallShardReply struct {
 	Err rpc.Err
+	Num shardcfg.Tnum
 }
 
 type DeleteShardArgs struct {
@@ -33,4 +34,5 @@ type DeleteShardArgs struct {
 
 type DeleteShardReply struct {
 	Err rpc.Err
+	Num shardcfg.Tnum
 }

@@ -14,6 +14,10 @@ const (
 	// For future kvraft lab
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrWrongGroup  = "ErrWrongGroup"
+
+	// ShardKV specific errors
+	ErrShardNotReady = "ErrShardNotReady"
+	ErrOldConfig     = "ErrOldConfig"
 )
 
 type Tversion uint64
@@ -37,4 +41,3 @@ type GetReply struct {
 	Version Tversion
 	Err     Err
 }
-

@@ -21,10 +21,12 @@ import (
 
 var MaxRaftState int
 var UseRaftStateMachine bool // to plug in another raft besided raft1
+var NoLeaseReads bool         // to turn off kvraft's lease-based reads
 
 func init() {
 	flag.BoolVar(&UseRaftStateMachine, "raft-state-machine", false, "use raft state machine")
 	flag.IntVar(&MaxRaftState, "max-raft-state", -1, "max raft state")
+	flag.BoolVar(&NoLeaseReads, "no-lease-reads", false, "serve kvraft Gets through the Raft log only")
 }
 
 type DaemonClnt struct {

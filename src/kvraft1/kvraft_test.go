@@ -476,3 +476,52 @@ func TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable4C(t *testing.T
 	tester.AnnotateTest("TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable4C", ts.nservers)
 	ts.GenericTest()
 }
+
+// Puts are exactly-once: many clients append to one key while the
+// network is unreliable and partitioned and the servers crash and
+// restart (with snapshots, so duplicate-detection state must survive
+// in them). No Put may return ErrMaybe, and no append may be lost or
+// applied twice.
+func TestExactlyOnceAppendsExt(t *testing.T) {
+	const (
+		NCLNT = 5
+		NSEC  = 6
+	)
+	ts := MakeTest(t, "Ext exactly-once appends", NCLNT, 5, false, true, true, 1000, false)
+	defer ts.Cleanup()
+	tester.AnnotateTest("TestExactlyOnceAppendsExt", 5)
+
+	ck := ts.MakeClerk()
+	if err := ts.PutJson(ck, "k", []kvtest.EntryN{}, 0, -1); err != rpc.OK {
+		t.Fatalf("Put initial value: %v", err)
+	}
+
+	ch := make(chan []kvtest.ClntRes)
+	go func() {
+		ch <- ts.SpawnClientsAndWait(NCLNT, NSEC*time.Second, func(me int, ck kvtest.IKVClerk, done chan struct{}) kvtest.ClntRes {
+			return ts.OneClientAppend(me, ck, done)
+		})
+	}()
+
+	time.Sleep(1 * time.Second)
+	chp := make(chan bool)
+	go ts.Partitioner(Gid, chp)
+	time.Sleep(2 * time.Second)
+	chp <- true
+	<-chp
+	ts.Group(Gid).ConnectAll()
+
+	ts.killall()
+	time.Sleep(kvtest.ElectionTimeout)
+	ts.restartall()
+
+	rs := <-ch
+	for c, r := range rs {
+		if r.Nmaybe != 0 {
+			t.Fatalf("client %d got %d ErrMaybe; Puts should be exactly-once", c, r.Nmaybe)
+		}
+	}
+	es := []kvtest.EntryN{}
+	ver := ts.GetJson(ck, "k", -1, &es)
+	ts.CheckAppends(es, NCLNT, rs, ver)
+}

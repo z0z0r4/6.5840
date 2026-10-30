@@ -109,9 +109,9 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 		// ErrWrongLeader or RPC failure, try the next server
 		ck.leader = (ck.leader + 1) % len(ck.servers)
 
-		if !ok {
-			sent = true
-		}
+		// Even an ErrWrongLeader reply may come from a server that already
+		// appended the Put to its log, and that entry can still commit.
+		sent = true
 
 		time.Sleep(100 * time.Millisecond)
 	}

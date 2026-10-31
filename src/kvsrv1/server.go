@@ -4,6 +4,8 @@ import (
 	"log"
 	"sync"
 
+	"github.com/google/uuid"
+
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
 	tester "6.5840/tester1"
@@ -24,13 +26,13 @@ type KVServer struct {
 
 	// The last Put executed for each clerk, to answer resent Puts
 	// without executing them a second time.
-	lastPut map[int64]rpc.Seen
+	lastPut map[uuid.UUID]rpc.Seen
 }
 
 func MakeKVServer() *KVServer {
 	kv := &KVServer{}
 	kv.kvStore = make(map[string]ValueVersion)
-	kv.lastPut = make(map[int64]rpc.Seen)
+	kv.lastPut = make(map[uuid.UUID]rpc.Seen)
 	return kv
 }
 
@@ -58,7 +60,7 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	if args.ClientId != 0 {
+	if args.ClientId != uuid.Nil {
 		if seen, ok := kv.lastPut[args.ClientId]; ok && args.Seq <= seen.Seq {
 			// A resend of a Put we already executed. A clerk has at most
 			// one Put outstanding, so an older Seq is a stale resend

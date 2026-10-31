@@ -12,7 +12,7 @@ type Clerk struct {
 	clnt    *tester.Clnt
 	servers []string
 	leader  int // last successful leader (index into servers[])
-	// You can add to this struct.
+	misses  int // servers tried without success since the last success
 }
 
 func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
@@ -23,6 +23,17 @@ func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 
 func (ck *Clerk) Leader() int {
 	return ck.leader
+}
+
+// Move on to the next server. Only pause after a whole round of servers
+// failed (e.g., during an election), so that finding the leader among
+// healthy servers doesn't cost a sleep per server.
+func (ck *Clerk) nextServer() {
+	ck.leader = (ck.leader + 1) % len(ck.servers)
+	ck.misses++
+	if ck.misses%len(ck.servers) == 0 {
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // Get fetches the current value and version for a key.  It returns
@@ -36,6 +47,7 @@ func (ck *Clerk) Leader() int {
 // must match the declared types of the RPC handler function's
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
+	defer func() { ck.misses = 0 }()
 	for {
 		args := rpc.GetArgs{Key: key}
 		reply := rpc.GetReply{}
@@ -54,9 +66,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 		}
 
 		// ErrWrongLeader or RPC failure, try the next server
-		ck.leader = (ck.leader + 1) % len(ck.servers)
-
-		time.Sleep(100 * time.Millisecond)
+		ck.nextServer()
 	}
 }
 
@@ -78,7 +88,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 // must match the declared types of the RPC handler function's
 // arguments. Additionally, reply must be passed as a pointer.
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
-	// You will have to modify this function.
+	defer func() { ck.misses = 0 }()
 	sent := false
 	for {
 		args := rpc.PutArgs{Key: key, Value: value, Version: version}
@@ -107,12 +117,10 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 		}
 
 		// ErrWrongLeader or RPC failure, try the next server
-		ck.leader = (ck.leader + 1) % len(ck.servers)
+		ck.nextServer()
 
 		// Even an ErrWrongLeader reply may come from a server that already
 		// appended the Put to its log, and that entry can still commit.
 		sent = true
-
-		time.Sleep(100 * time.Millisecond)
 	}
 }

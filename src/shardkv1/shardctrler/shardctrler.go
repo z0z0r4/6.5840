@@ -5,7 +5,7 @@ package shardctrler
 //
 
 import (
-	kvsrv "6.5840/kvsrv1"
+	kvraft "6.5840/kvraft1"
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
 	"6.5840/shardkv1/shardcfg"
@@ -25,11 +25,11 @@ type ShardCtrler struct {
 	// Your data here.
 }
 
-// Make a ShardCltler, which stores its state in a kvsrv.
-func MakeShardCtrler(clnt *tester.Clnt) *ShardCtrler {
+// Make a ShardCltler, which stores its state in the kvraft group
+// formed by servers.
+func MakeShardCtrler(clnt *tester.Clnt, servers []string) *ShardCtrler {
 	sck := &ShardCtrler{clnt: clnt, grpClerks: make(map[tester.Tgid]*shardgrp.Clerk)}
-	srv := tester.ServerName(tester.GRP0, 0)
-	sck.IKVClerk = kvsrv.MakeClerk(clnt, srv)
+	sck.IKVClerk = kvraft.MakeClerk(clnt, servers)
 	// Your code here.
 	return sck
 }
@@ -50,7 +50,7 @@ func (sck *ShardCtrler) applyConfig(cur *shardcfg.ShardConfig, new *shardcfg.Sha
 		newGid := new.Shards[shard]
 
 		if curGid != newGid {
-			// Shard ownership has changed, so we need to update the kvsrv for the new owner
+			// Shard ownership has changed, so we need to update kvraft for the new owner
 			curOwner := sck.grpClerk(curGid, cur.Groups[curGid])
 			newOwner := sck.grpClerk(newGid, new.Groups[newGid])
 
@@ -121,7 +121,7 @@ func (sck *ShardCtrler) applyConfig(cur *shardcfg.ShardConfig, new *shardcfg.Sha
 }
 
 func (sck *ShardCtrler) get_config(key string) (*shardcfg.ShardConfig, rpc.Tversion, rpc.Err) {
-	// Get the current configuration from the kvsrv
+	// Get the current configuration from kvraft
 	config_, v, err := sck.Get(key)
 	if err != rpc.OK {
 		return nil, 0, err
@@ -131,7 +131,7 @@ func (sck *ShardCtrler) get_config(key string) (*shardcfg.ShardConfig, rpc.Tvers
 }
 
 func (sck *ShardCtrler) put_config(key string, cfg *shardcfg.ShardConfig, version rpc.Tversion) bool {
-	// Update the kvsrv for the new configuration
+	// Update kvraft for the new configuration
 	err := sck.Put(key, cfg.String(), version)
 	switch err {
 	case rpc.ErrVersion:
@@ -154,7 +154,7 @@ func (sck *ShardCtrler) InitController() {
 	if nerr == rpc.ErrNoKey {
 		return
 	} else if nerr != rpc.OK {
-		panic("InitController: failed to get next_config from kvsrv")
+		panic("InitController: failed to get next_config from kvraft")
 	}
 
 	cur, v, err := sck.get_config("config")
@@ -170,13 +170,13 @@ func (sck *ShardCtrler) InitController() {
 			}
 		}
 	} else {
-		panic("InitController: failed to get config from kvsrv")
+		panic("InitController: failed to get config from kvraft")
 	}
 }
 
 // Called once by the tester to supply the first configuration.  You
 // can marshal ShardConfig into a string using shardcfg.String(), and
-// then Put it in the kvsrv for the controller at version 0.  You can
+// then Put it in kvraft for the controller at version 0.  You can
 // pick the key to name the configuration.  The initial configuration
 // lists shardgrp shardcfg.Gid1 for all shards.
 func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
@@ -189,10 +189,10 @@ func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 // changes the configuration it may be superseded by another
 // controller.
 func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
-	// get current config from kvsrv
+	// get current config from kvraft
 	cur, v, err := sck.get_config("config")
 	if err != rpc.OK {
-		panic("ChangeConfigTo: failed to get current config from kvsrv")
+		panic("ChangeConfigTo: failed to get current config from kvraft")
 	}
 
 	if cur.Num+1 != new.Num {
@@ -210,7 +210,7 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 			next_config = new
 		}
 	} else if nerr != rpc.OK {
-		panic("ChangeConfigTo: failed to get next_config from kvsrv")
+		panic("ChangeConfigTo: failed to get next_config from kvraft")
 	}
 
 	if !sck.applyConfig(cur, next_config) {
@@ -229,7 +229,7 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 func (sck *ShardCtrler) Query() *shardcfg.ShardConfig {
 	s, _, err := sck.get_config("config")
 	if err != rpc.OK {
-		panic("Query: failed to get current config from kvsrv")
+		panic("Query: failed to get current config from kvraft")
 	}
 	return s
 }

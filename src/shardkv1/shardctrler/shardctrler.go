@@ -5,8 +5,6 @@ package shardctrler
 //
 
 import (
-	"strconv"
-
 	kvsrv "6.5840/kvsrv1"
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
@@ -24,39 +22,7 @@ type ShardCtrler struct {
 
 	grpClerks map[tester.Tgid]*shardgrp.Clerk // one clerk per group, so each remembers its leader
 
-	// Set by InitController: this controller's position in the sequence
-	// of controllers. 0 if InitController wasn't called.
-	epoch int
-}
-
-// Key in kvsrv holding the epoch of the latest controller.
-const epochKey = "ctrler_epoch"
-
-// Claim the next controller epoch.
-func (sck *ShardCtrler) claimEpoch() int {
-	for {
-		s, v, err := sck.Get(epochKey)
-		n := 0
-		if err == rpc.OK {
-			n, _ = strconv.Atoi(s)
-		}
-		if sck.Put(epochKey, strconv.Itoa(n+1), v) == rpc.OK {
-			return n + 1
-		}
-	}
-}
-
-// Whether a newer controller has started since this one. A superseded
-// controller stops making configuration changes, so that an old
-// controller that comes back after a partition bails out instead of
-// competing with its successor.
-func (sck *ShardCtrler) superseded() bool {
-	if sck.epoch == 0 {
-		return false
-	}
-	s, _, err := sck.Get(epochKey)
-	n, _ := strconv.Atoi(s)
-	return err == rpc.OK && n > sck.epoch
+	// Your data here.
 }
 
 // Make a ShardCltler, which stores its state in a kvsrv.
@@ -184,8 +150,6 @@ func (sck *ShardCtrler) put_config(key string, cfg *shardcfg.ShardConfig, versio
 // controller. In part A, this method doesn't need to do anything. In
 // B and C, this method implements recovery.
 func (sck *ShardCtrler) InitController() {
-	sck.epoch = sck.claimEpoch()
-
 	next_config, _, nerr := sck.get_config("next_config")
 	if nerr == rpc.ErrNoKey {
 		return
@@ -225,10 +189,6 @@ func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 // changes the configuration it may be superseded by another
 // controller.
 func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
-	if sck.superseded() {
-		return
-	}
-
 	// get current config from kvsrv
 	cur, v, err := sck.get_config("config")
 	if err != rpc.OK {

@@ -104,16 +104,17 @@ func (rsm *RSM) listenApplyCh() {
 			rsm.lastApplied = max(rsm.lastApplied, msg.CommandIndex)
 			rsm.mu.Unlock()
 		} else if msg.SnapshotValid {
-			rsm.applySnapshot(msg.Snapshot)
+			rsm.applySnapshot(msg.Snapshot, msg.SnapshotIndex)
 		}
 	}
 }
 
-func (rsm *RSM) applySnapshot(snapshot []byte) {
+func (rsm *RSM) applySnapshot(snapshot []byte, index int) {
 	rsm.mu.Lock()
 	defer rsm.mu.Unlock()
 
 	rsm.sm.Restore(snapshot)
+	rsm.lastApplied = max(rsm.lastApplied, index)
 }
 
 func (rsm *RSM) watchSnapshot() {

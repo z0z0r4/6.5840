@@ -18,12 +18,12 @@ const (
 )
 
 type Shrad struct {
-	owned  bool
-	frozen bool
+	Owned  bool
+	Frozen bool
 
-	installed_at shardcfg.Tnum
-	frozen_at    shardcfg.Tnum
-	deleted_at   shardcfg.Tnum
+	InstalledAt shardcfg.Tnum
+	FrozenAt    shardcfg.Tnum
+	DeletedAt   shardcfg.Tnum
 }
 
 type KVServer struct {
@@ -77,12 +77,12 @@ func (kv *KVServer) SnapshotShardStateLocked(shard shardcfg.Tshid) []byte {
 func (kv *KVServer) DoGetOp(args *rpc.GetArgs) any {
 	var rep any
 	shard := shardcfg.Key2Shard(args.Key)
-	if !kv.shards[shard].owned {
+	if !kv.shards[shard].Owned {
 		rep = rpc.GetReply{Err: rpc.ErrWrongGroup}
 		return rep
 	}
 
-	if kv.shards[shard].frozen {
+	if kv.shards[shard].Frozen {
 		rep = rpc.GetReply{Err: rpc.ErrShardNotReady}
 		return rep
 	}
@@ -103,12 +103,12 @@ func (kv *KVServer) DoPutOp(args *rpc.PutArgs) any {
 	var rep any
 	shard := shardcfg.Key2Shard(args.Key)
 
-	if !kv.shards[shard].owned {
+	if !kv.shards[shard].Owned {
 		rep = rpc.PutReply{Err: rpc.ErrWrongGroup}
 		return rep
 	}
 
-	if kv.shards[shard].frozen {
+	if kv.shards[shard].Frozen {
 		rep = rpc.PutReply{Err: rpc.ErrShardNotReady}
 		return rep
 	}
@@ -134,8 +134,8 @@ func (kv *KVServer) DoGetShardOp(args *shardrpc.GetShardArgs) any {
 	defer kv.mu.Unlock()
 
 	state := kv.SnapshotShardStateLocked(args.Shard)
-	owned := kv.shards[args.Shard].owned
-	frozen := kv.shards[args.Shard].frozen
+	owned := kv.shards[args.Shard].Owned
+	frozen := kv.shards[args.Shard].Frozen
 
 	if owned {
 		return shardrpc.GetShardReply{State: state, Owned: owned, Frozen: frozen, Err: rpc.OK}
@@ -159,18 +159,18 @@ func (kv *KVServer) DoFrozenShardOp(args *shardrpc.FreezeShardArgs) any {
 	if kv.configNum > args.Num {
 		rep = shardrpc.FreezeShardReply{Err: rpc.ErrOldConfig, Num: kv.configNum}
 		return rep
-	} else if kv.configNum == args.Num && kv.shards[args.Shard].frozen_at == args.Num {
+	} else if kv.configNum == args.Num && kv.shards[args.Shard].FrozenAt == args.Num {
 		return shardrpc.FreezeShardReply{Err: rpc.ErrDuplicateOp, Num: kv.configNum}
 	}
 	kv.configNum = args.Num
 
-	if !kv.shards[args.Shard].owned {
+	if !kv.shards[args.Shard].Owned {
 		rep = shardrpc.FreezeShardReply{Err: rpc.ErrWrongGroup, Num: kv.configNum}
 		return rep
 	}
 
-	kv.shards[args.Shard].frozen_at = args.Num
-	kv.shards[args.Shard].frozen = true
+	kv.shards[args.Shard].FrozenAt = args.Num
+	kv.shards[args.Shard].Frozen = true
 	rep = shardrpc.FreezeShardReply{Err: rpc.OK, Num: kv.configNum}
 	return rep
 }
@@ -184,7 +184,7 @@ func (kv *KVServer) DoInstallShardOp(args *shardrpc.InstallShardArgs) any {
 	if kv.configNum > args.Num {
 		rep = shardrpc.InstallShardReply{Err: rpc.ErrOldConfig, Num: kv.configNum}
 		return rep
-	} else if kv.configNum == args.Num && kv.shards[args.Shard].installed_at == args.Num {
+	} else if kv.configNum == args.Num && kv.shards[args.Shard].InstalledAt == args.Num {
 		return shardrpc.InstallShardReply{Err: rpc.ErrDuplicateOp, Num: kv.configNum}
 	}
 	kv.configNum = args.Num
@@ -192,9 +192,9 @@ func (kv *KVServer) DoInstallShardOp(args *shardrpc.InstallShardArgs) any {
 	kv.applyShardStateLocked(args.Shard, args.State)
 
 	// Mark the shard as no longer frozen
-	kv.shards[args.Shard].frozen = false
-	kv.shards[args.Shard].owned = true
-	kv.shards[args.Shard].installed_at = args.Num
+	kv.shards[args.Shard].Frozen = false
+	kv.shards[args.Shard].Owned = true
+	kv.shards[args.Shard].InstalledAt = args.Num
 
 	rep = shardrpc.InstallShardReply{Err: rpc.OK, Num: kv.configNum}
 	return rep
@@ -209,12 +209,12 @@ func (kv *KVServer) DoDeleteShardOp(args *shardrpc.DeleteShardArgs) any {
 	if kv.configNum > args.Num {
 		rep = shardrpc.DeleteShardReply{Err: rpc.ErrOldConfig, Num: kv.configNum}
 		return rep
-	} else if kv.configNum == args.Num && kv.shards[args.Shard].deleted_at == args.Num {
+	} else if kv.configNum == args.Num && kv.shards[args.Shard].DeletedAt == args.Num {
 		return shardrpc.DeleteShardReply{Err: rpc.ErrDuplicateOp, Num: kv.configNum}
 	}
 	kv.configNum = args.Num
 
-	if !kv.shards[args.Shard].frozen {
+	if !kv.shards[args.Shard].Frozen {
 		rep = shardrpc.DeleteShardReply{Err: rpc.ErrWrongGroup, Num: kv.configNum}
 		return rep
 	}
@@ -223,8 +223,8 @@ func (kv *KVServer) DoDeleteShardOp(args *shardrpc.DeleteShardArgs) any {
 	delete(kv.kvStore, args.Shard)
 
 	// Mark the shard as no longer owned
-	kv.shards[args.Shard].owned = false
-	kv.shards[args.Shard].deleted_at = args.Num
+	kv.shards[args.Shard].Owned = false
+	kv.shards[args.Shard].DeletedAt = args.Num
 
 	rep = shardrpc.DeleteShardReply{Err: rpc.OK, Num: kv.configNum}
 	return rep
@@ -354,12 +354,12 @@ func StartServerShardGrp(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, p
 	}
 	kv.shards = make(map[shardcfg.Tshid]*Shrad)
 	for i := 0; i < shardcfg.NShards; i++ {
-		kv.shards[shardcfg.Tshid(i)] = &Shrad{owned: false, frozen: false}
+		kv.shards[shardcfg.Tshid(i)] = &Shrad{Owned: false, Frozen: false}
 	}
 	if kv.gid == 1 {
 		// Own all shards initially
 		for i := 0; i < shardcfg.NShards; i++ {
-			kv.shards[shardcfg.Tshid(i)].owned = true
+			kv.shards[shardcfg.Tshid(i)].Owned = true
 		}
 	}
 

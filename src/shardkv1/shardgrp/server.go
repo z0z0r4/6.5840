@@ -40,6 +40,8 @@ type KVServer struct {
 
 	shards map[shardcfg.Tshid]*Shrad // shard state
 
+	txns map[shardcfg.Tshid]*ShardTxns // per-shard transaction locks and state, see txn.go
+
 	configNum shardcfg.Tnum // current configuration number
 }
 
@@ -48,14 +50,27 @@ type ValueVersion struct {
 	Version rpc.Tversion
 }
 
+// What moves with a shard: its key/values and its transaction state.
+type ShardState struct {
+	KV   map[string]ValueVersion
+	Txns *ShardTxns
+}
+
 func (kv *KVServer) applyShardStateLocked(shard shardcfg.Tshid, state []byte) {
 	// Restore the state of the shard from the provided state
-	shard_state := make(map[string]ValueVersion)
+	shard_state := ShardState{}
 	r := bytes.NewReader(state)
 	d := labgob.NewDecoder(r)
 	d.Decode(&shard_state)
 
-	kv.kvStore[shard] = shard_state
+	if shard_state.KV == nil {
+		shard_state.KV = make(map[string]ValueVersion)
+	}
+	if shard_state.Txns == nil {
+		shard_state.Txns = makeShardTxns()
+	}
+	kv.kvStore[shard] = shard_state.KV
+	kv.txns[shard] = shard_state.Txns
 }
 
 func (kv *KVServer) SnapshotShardStateLocked(shard shardcfg.Tshid) []byte {
@@ -69,7 +84,7 @@ func (kv *KVServer) SnapshotShardStateLocked(shard shardcfg.Tshid) []byte {
 
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	e.Encode(shard_state)
+	e.Encode(ShardState{KV: shard_state, Txns: kv.txns[shard]})
 
 	return w.Bytes()
 }
@@ -85,7 +100,7 @@ func (kv *KVServer) DoGetOp(args *rpc.GetArgs) any {
 		return rep
 	}
 
-	if kv.shards[shard].Frozen {
+	if kv.shards[shard].Frozen || kv.txns[shard].blocks(args.Key, false) {
 		rep = rpc.GetReply{Err: rpc.ErrShardNotReady}
 		return rep
 	}
@@ -111,7 +126,7 @@ func (kv *KVServer) DoPutOp(args *rpc.PutArgs) any {
 		return rep
 	}
 
-	if kv.shards[shard].Frozen {
+	if kv.shards[shard].Frozen || kv.txns[shard].blocks(args.Key, true) {
 		rep = rpc.PutReply{Err: rpc.ErrShardNotReady}
 		return rep
 	}
@@ -224,6 +239,7 @@ func (kv *KVServer) DoDeleteShardOp(args *shardrpc.DeleteShardArgs) any {
 
 	// Delete the specified shard
 	delete(kv.kvStore, args.Shard)
+	kv.txns[args.Shard] = makeShardTxns()
 
 	// Mark the shard as no longer owned
 	kv.shards[args.Shard].Owned = false
@@ -247,6 +263,12 @@ func (kv *KVServer) DoOp(req any) any {
 		return kv.DoDeleteShardOp(&args)
 	} else if args, ok := req.(shardrpc.GetShardArgs); ok {
 		return kv.DoGetShardOp(&args)
+	} else if args, ok := req.(shardrpc.TxnGetArgs); ok {
+		return kv.DoTxnGetOp(&args)
+	} else if args, ok := req.(shardrpc.TxnPrepareArgs); ok {
+		return kv.DoTxnPrepareOp(&args)
+	} else if args, ok := req.(shardrpc.TxnFinishArgs); ok {
+		return kv.DoTxnFinishOp(&args)
 	} else {
 		// print type
 		println("DoOp: unknown request type")
@@ -265,6 +287,7 @@ func (kv *KVServer) Snapshot() []byte {
 	e.Encode(kv.kvStore)
 	e.Encode(kv.configNum)
 	e.Encode(kv.shards)
+	e.Encode(kv.txns)
 	return w.Bytes()
 }
 
@@ -277,6 +300,7 @@ func (kv *KVServer) Restore(data []byte) {
 	d.Decode(&kv.kvStore)
 	d.Decode(&kv.configNum)
 	d.Decode(&kv.shards)
+	d.Decode(&kv.txns)
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
@@ -348,6 +372,9 @@ func StartServerShardGrp(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, p
 	labgob.Register(shardrpc.InstallShardArgs{})
 	labgob.Register(shardrpc.DeleteShardArgs{})
 	labgob.Register(shardrpc.GetShardArgs{})
+	labgob.Register(shardrpc.TxnGetArgs{})
+	labgob.Register(shardrpc.TxnPrepareArgs{})
+	labgob.Register(shardrpc.TxnFinishArgs{})
 	labgob.Register(rsm.Op{})
 
 	kv := &KVServer{gid: gid, me: me}
@@ -356,8 +383,10 @@ func StartServerShardGrp(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, p
 		kv.kvStore[shardcfg.Tshid(i)] = make(map[string]ValueVersion)
 	}
 	kv.shards = make(map[shardcfg.Tshid]*Shrad)
+	kv.txns = make(map[shardcfg.Tshid]*ShardTxns)
 	for i := 0; i < shardcfg.NShards; i++ {
 		kv.shards[shardcfg.Tshid(i)] = &Shrad{Owned: false, Frozen: false}
+		kv.txns[shardcfg.Tshid(i)] = makeShardTxns()
 	}
 	if kv.gid == 1 {
 		// Own all shards initially

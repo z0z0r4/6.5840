@@ -59,3 +59,20 @@ type GetReply struct {
 	Version Tversion
 	Err     Err
 }
+
+// Range returns every key in [Low, High], in ascending order.
+type RangeArgs struct {
+	Low  string
+	High string
+}
+
+type KeyValue struct {
+	Key     string
+	Value   string
+	Version Tversion
+}
+
+type RangeReply struct {
+	KVs []KeyValue
+	Err Err
+}

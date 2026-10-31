@@ -5,4 +5,6 @@ go 1.22
 require (
 	github.com/anishathalye/porcupine v1.0.3
 	github.com/google/uuid v1.6.0
+	github.com/tidwall/btree v1.8.2
 )
+

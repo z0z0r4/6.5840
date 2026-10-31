@@ -69,3 +69,16 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 		time.Sleep(100 * time.Millisecond)
 	}
 }
+
+// Range returns every key in [low, high] in ascending order, with its
+// value and version. It keeps trying until the server replies.
+func (ck *Clerk) Range(low, high string) ([]rpc.KeyValue, rpc.Err) {
+	for {
+		args := rpc.RangeArgs{Low: low, High: high}
+		reply := rpc.RangeReply{}
+		if ok := ck.clnt.Call(ck.server, "KVServer.Range", &args, &reply); ok {
+			return reply.KVs, reply.Err
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}

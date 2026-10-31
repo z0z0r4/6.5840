@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+	"github.com/tidwall/btree"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
@@ -22,7 +23,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 
 type KVServer struct {
 	mu      sync.Mutex
-	kvStore map[string]ValueVersion
+	kvStore *btree.Map[string, ValueVersion] // ordered, so that Range only visits the keys it returns
 
 	// The last Put executed for each clerk, to answer resent Puts
 	// without executing them a second time.
@@ -31,7 +32,7 @@ type KVServer struct {
 
 func MakeKVServer() *KVServer {
 	kv := &KVServer{}
-	kv.kvStore = make(map[string]ValueVersion)
+	kv.kvStore = new(btree.Map[string, ValueVersion])
 	kv.lastPut = make(map[uuid.UUID]rpc.Seen)
 	return kv
 }
@@ -42,7 +43,7 @@ func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	if vv, ok := kv.kvStore[args.Key]; ok {
+	if vv, ok := kv.kvStore.Get(args.Key); ok {
 		reply.Value = vv.Value
 		reply.Version = vv.Version
 		reply.Err = rpc.OK
@@ -73,9 +74,9 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 		}()
 	}
 
-	if vv, ok := kv.kvStore[args.Key]; ok {
+	if vv, ok := kv.kvStore.Get(args.Key); ok {
 		if vv.Version == args.Version {
-			kv.kvStore[args.Key] = ValueVersion{Value: args.Value, Version: args.Version + 1}
+			kv.kvStore.Set(args.Key, ValueVersion{Value: args.Value, Version: args.Version + 1})
 			reply.Err = rpc.OK
 			// fmt.Printf("OK\n")
 		} else {
@@ -84,7 +85,7 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 		}
 	} else {
 		if args.Version == 0 {
-			kv.kvStore[args.Key] = ValueVersion{Value: args.Value, Version: 1}
+			kv.kvStore.Set(args.Key, ValueVersion{Value: args.Value, Version: 1})
 			reply.Err = rpc.OK
 			// fmt.Printf("OK\n")
 		} else {
@@ -97,6 +98,24 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	// for k, v := range kv.kvStore {
 	// 	fmt.Printf("Key: %s, Value: %s, Version: %d\n", k, v.Value, v.Version)
 	// }
+}
+
+// Range returns the keys in [args.Low, args.High] in ascending order,
+// with their values and versions.
+func (kv *KVServer) Range(args *rpc.RangeArgs, reply *rpc.RangeReply) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	reply.KVs = []rpc.KeyValue{}
+	// Ascend visits keys >= Low in order; stop after High.
+	kv.kvStore.Ascend(args.Low, func(key string, vv ValueVersion) bool {
+		if key > args.High {
+			return false
+		}
+		reply.KVs = append(reply.KVs, rpc.KeyValue{Key: key, Value: vv.Value, Version: vv.Version})
+		return true
+	})
+	reply.Err = rpc.OK
 }
 
 // You can ignore all arguments; they are for replicated KVservers

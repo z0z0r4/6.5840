@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"sync"
 
+	"github.com/google/uuid"
+
 	"6.5840/kvraft1/rsm"
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labgob"
@@ -21,7 +23,7 @@ type KVServer struct {
 
 	// The last Put executed for each clerk. Resends of a Put can end up
 	// in the log more than once; only the first one is executed.
-	lastPut map[int64]rpc.Seen
+	lastPut map[uuid.UUID]rpc.Seen
 }
 
 type ValueVersion struct {
@@ -48,7 +50,7 @@ func (kv *KVServer) DoOp(req any) any {
 		}
 	} else if args, ok := req.(rpc.PutArgs); ok {
 		// println("DoOp: Put", args.Key, "with version", args.Version)
-		if seen, ok := kv.lastPut[args.ClientId]; args.ClientId != 0 && ok && args.Seq <= seen.Seq {
+		if seen, ok := kv.lastPut[args.ClientId]; args.ClientId != uuid.Nil && ok && args.Seq <= seen.Seq {
 			return rpc.PutReply{Err: seen.Err}
 		}
 		if vv, ok := kv.kvStore[args.Key]; ok {
@@ -64,7 +66,7 @@ func (kv *KVServer) DoOp(req any) any {
 		} else {
 			rep = rpc.PutReply{Err: rpc.ErrNoKey}
 		}
-		if args.ClientId != 0 {
+		if args.ClientId != uuid.Nil {
 			kv.lastPut[args.ClientId] = rpc.Seen{Seq: args.Seq, Err: rep.(rpc.PutReply).Err}
 		}
 	} else {
@@ -95,7 +97,7 @@ func (kv *KVServer) Restore(data []byte) {
 	r := bytes.NewReader(data)
 	d := labgob.NewDecoder(r)
 	kvStore := make(map[string]ValueVersion)
-	lastPut := make(map[int64]rpc.Seen)
+	lastPut := make(map[uuid.UUID]rpc.Seen)
 	if d.Decode(&kvStore) != nil || d.Decode(&lastPut) != nil {
 		panic("Restore: bad snapshot")
 	}
@@ -141,7 +143,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	kv := &KVServer{me: me}
 
 	kv.kvStore = make(map[string]ValueVersion)
-	kv.lastPut = make(map[int64]rpc.Seen)
+	kv.lastPut = make(map[uuid.UUID]rpc.Seen)
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	// You may need initialization code here.
 	return []any{kv, kv.rsm.Raft()}

@@ -3,6 +3,8 @@ package kvraft
 import (
 	"time"
 
+	"github.com/google/uuid"
+
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
 	tester "6.5840/tester1"
@@ -14,12 +16,12 @@ type Clerk struct {
 	leader  int // last successful leader (index into servers[])
 	misses  int // servers tried without success since the last success
 
-	clientId int64
+	clientId uuid.UUID
 	seq      int64 // Seq of the last Put
 }
 
 func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
-	ck := &Clerk{clnt: clnt, servers: servers, clientId: rpc.NewClientId()}
+	ck := &Clerk{clnt: clnt, servers: servers, clientId: uuid.New()}
 	return ck
 }
 

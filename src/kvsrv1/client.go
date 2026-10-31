@@ -3,6 +3,8 @@ package kvsrv
 import (
 	"time"
 
+	"github.com/google/uuid"
+
 	"6.5840/kvsrv1/rpc"
 	kvtest "6.5840/kvtest1"
 	tester "6.5840/tester1"
@@ -12,12 +14,12 @@ type Clerk struct {
 	clnt   *tester.Clnt
 	server string
 
-	clientId int64
+	clientId uuid.UUID
 	seq      int64 // Seq of the last Put
 }
 
 func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
-	ck := &Clerk{clnt: clnt, server: server, clientId: rpc.NewClientId()}
+	ck := &Clerk{clnt: clnt, server: server, clientId: uuid.New()}
 	return ck
 }
 

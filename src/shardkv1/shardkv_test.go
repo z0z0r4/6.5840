@@ -18,17 +18,16 @@ const (
 	NKEYS = 5 * shardcfg.NShards
 )
 
-// Test shard controller's Init and Query with a key/value server from
-// kvsrv1 lab.
+// Test shard controller's Init and Query with the kvraft group that
+// stores its configuration.
 func TestInitQuery5A(t *testing.T) {
 
-	// MakeTest starts your lab2 key/value server using
-	// `kvsrv.StartKVServer`.
+	// MakeTest starts your lab4 kvraft servers in group Controler.
 	ts := MakeTest(t, "Test (5A): Init and Query ...", true)
 	defer ts.Cleanup()
 
 	// Make a shard controller
-	sck := shardctrler.MakeShardCtrler(ts.Config.MakeClient())
+	sck := shardctrler.MakeShardCtrler(ts.Config.MakeClient(), ts.Group(Controler).SrvNames())
 
 	// Make an empty shard configuration
 	scfg := shardcfg.MakeShardConfig()
@@ -719,4 +718,44 @@ func TestPartitionRecoveryUnreliableClerks5C(t *testing.T) {
 		NPARTITION = 3
 	)
 	partitionRecovery5C(t, false, NPARTITION, 5)
+}
+
+// The controller stores its configurations in a kvraft group. Take
+// each kvraft peer down in turn (so at some point the kvraft leader is
+// down) and check that a controller can still query the configuration
+// and move shards with a join and a leave.
+func TestCtrlerKVRaftPeerDownExt(t *testing.T) {
+	ts := MakeTest(t, "Test (Ext): controller with a kvraft peer down ...", true)
+	defer ts.Cleanup()
+
+	gid := ts.setupKVService()
+	ck := ts.MakeClerk()
+	ka, va := ts.SpreadPuts(ck, NKEYS)
+
+	for i := 0; i < NSRV; i++ {
+		ts.Group(Controler).ShutdownServer(i)
+
+		sck := ts.makeShardCtrler()
+		sck.InitController()
+		if cfg := sck.Query(); !cfg.IsMember(gid) {
+			ts.Fatalf("Query with kvraft peer %d down: %d not a member of %v", i, gid, cfg)
+		}
+
+		ngid := ts.newGid()
+		if ok := ts.joinGroups(sck, []tester.Tgid{ngid}); !ok {
+			ts.Fatalf("join %d failed with kvraft peer %d down", ngid, i)
+		}
+		for j := 0; j < len(ka); j++ {
+			ts.CheckGet(ck, ka[j], va[j], rpc.Tversion(1))
+		}
+		if ok := ts.leaveGroups(sck, []tester.Tgid{ngid}); !ok {
+			ts.Fatalf("leave %d failed with kvraft peer %d down", ngid, i)
+		}
+		for j := 0; j < len(ka); j++ {
+			ts.CheckGet(ck, ka[j], va[j], rpc.Tversion(1))
+		}
+
+		ts.Group(Controler).StartServer(i)
+		ts.Group(Controler).ConnectOne(i)
+	}
 }

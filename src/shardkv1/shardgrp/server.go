@@ -75,6 +75,9 @@ func (kv *KVServer) SnapshotShardStateLocked(shard shardcfg.Tshid) []byte {
 }
 
 func (kv *KVServer) DoGetOp(args *rpc.GetArgs) any {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
 	var rep any
 	shard := shardcfg.Key2Shard(args.Key)
 	if !kv.shards[shard].Owned {

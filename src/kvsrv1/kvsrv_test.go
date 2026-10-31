@@ -66,9 +66,7 @@ func TestPutConcurrentReliable(t *testing.T) {
 	ts.CheckPorcupineT(PORCUPINETIME)
 }
 
-// Check if memory used on server is reasonable. Exactly-once Puts
-// require the server to remember the last Put of every clerk, so allow
-// a small, constant amount of memory per clerk.
+// Check if memory used on server is reasonable
 func TestMemPutManyClientsReliable(t *testing.T) {
 	const (
 		NCLIENT = 20_000
@@ -107,7 +105,7 @@ func TestMemPutManyClientsReliable(t *testing.T) {
 
 	m1 := ts.Config.Group(0).MemSize()
 	f := (float64(m1) - float64(m0)) / NCLIENT
-	if m1 > m0+(NCLIENT*100) {
+	if m1 > m0+(NCLIENT*10) {
 		t.Fatalf("error: server using too much memory %d %d (%.2f byte per client)\n", m0, m1, f)
 	}
 }
@@ -202,5 +200,89 @@ func TestMemManyPutsOneClient(t *testing.T) {
 	m1 := ts.Config.Group(0).MemSize()
 	if m1 > m0+100_000 {
 		t.Fatalf("error: server memory grew from %d to %d after %d puts by one clerk", m0, m1, NPUT)
+	}
+}
+
+// Gets don't need duplicate detection, so the server must not remember
+// anything per Get, in particular not the value it returned (ported
+// from TestMemGetManyClients in the 2024 lab). Each clerk's first Get
+// is of a missing key and only sets up the RPC connection; its second
+// Get returns a MEM-byte value.
+func TestMemGetManyClientsReliable(t *testing.T) {
+	const (
+		NCLIENT = 20_000
+		MEM     = 1000
+	)
+
+	ts := MakeTestKV(t, true)
+	defer ts.Cleanup()
+
+	ck := ts.MakeClerk()
+	v := kvtest.RandValue(MEM)
+	if err := ck.Put("k", v, 0); err != rpc.OK {
+		t.Fatalf("Put failed %v", err)
+	}
+
+	cks := make([]kvtest.IKVClerk, NCLIENT)
+	for i, _ := range cks {
+		cks[i] = ts.MakeClerk()
+	}
+
+	// force allocation of ends for server in each client
+	for i := 0; i < NCLIENT; i++ {
+		if _, _, err := cks[i].Get("nokey"); err != rpc.ErrNoKey {
+			t.Fatalf("Get failed %v", err)
+		}
+	}
+
+	ts.Begin("Test: memory use many get clients")
+
+	// allow threads started by labrpc to start
+	time.Sleep(1 * time.Second)
+
+	m0 := ts.Config.Group(0).MemSize()
+
+	for i := 0; i < NCLIENT; i++ {
+		if val, _, err := cks[i].Get("k"); err != rpc.OK || val != v {
+			t.Fatalf("Get failed %v", err)
+		}
+	}
+
+	m1 := ts.Config.Group(0).MemSize()
+	f := (float64(m1) - float64(m0)) / NCLIENT
+	if m1 > m0+(NCLIENT*10) {
+		t.Fatalf("error: server using too much memory %d %d (%.2f byte per client)\n", m0, m1, f)
+	}
+}
+
+// The duplicate-detection state must not keep a Put's value alive: once
+// a large value is overwritten, the server's memory must go back down
+// (ported from TestMemPut2 in the 2024 lab).
+func TestMemPutLargeValue(t *testing.T) {
+	const MEM = 10 << 20 // 10 MiB
+
+	ts := MakeTestKV(t, true)
+	defer ts.Cleanup()
+
+	ts.Begin("Test: memory use put of a large value")
+
+	ck0 := ts.MakeClerk()
+	ck1 := ts.MakeClerk()
+	if err := ck1.Put("other", "", 0); err != rpc.OK {
+		t.Fatalf("Put failed %v", err)
+	}
+
+	m0 := ts.Config.Group(0).MemSize()
+
+	if err := ck0.Put("k", kvtest.RandValue(MEM), 0); err != rpc.OK {
+		t.Fatalf("Put failed %v", err)
+	}
+	if err := ck1.Put("k", "", 1); err != rpc.OK {
+		t.Fatalf("Put failed %v", err)
+	}
+
+	m1 := ts.Config.Group(0).MemSize()
+	if m1 > m0+MEM/2 {
+		t.Fatalf("error: server using too much memory %d %d after overwriting a %d-byte value\n", m0, m1, MEM)
 	}
 }

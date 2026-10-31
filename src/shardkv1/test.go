@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"6.5840/kvsrv1"
 	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
 	"6.5840/shardkv1/shardcfg"
@@ -45,7 +44,7 @@ func MakeTestMaxRaft(t *testing.T, part string, reliable, partition bool, maxraf
 		partition:    partition,
 		maxraftstate: maxraftstate,
 	}
-	cfg := tester.MakeConfig(t, 1, reliable, "kvsrv1d", []string{})
+	cfg := tester.MakeConfig(t, NSRV, reliable, "kvraft1d", []string{})
 	ts.Test = kvtest.MakeTest(t, cfg, false, ts)
 	// XXX to avoid panic
 	tester.AnnotateTest(part, 1)
@@ -83,13 +82,7 @@ func (ts *Test) makeShardCtrler() *shardctrler.ShardCtrler {
 
 func (ts *Test) makeShardCtrlerClnt() (*shardctrler.ShardCtrler, *tester.Clnt) {
 	clnt := ts.Config.MakeClient()
-	return shardctrler.MakeShardCtrler(clnt), clnt
-}
-
-func (ts *Test) makeKVClerk() *kvsrv.Clerk {
-	srv := tester.ServerName(tester.GRP0, 0)
-	clnt := ts.Config.MakeClient()
-	return kvsrv.MakeClerk(clnt, srv).(*kvsrv.Clerk)
+	return shardctrler.MakeShardCtrler(clnt, ts.Group(Controler).SrvNames()), clnt
 }
 
 func (ts *Test) newGid() tester.Tgid {

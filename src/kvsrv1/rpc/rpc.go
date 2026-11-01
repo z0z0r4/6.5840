@@ -18,12 +18,6 @@ const (
 	// For future kvraft lab
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrWrongGroup  = "ErrWrongGroup"
-
-	// ShardKV specific errors
-	ErrShardNotReady = "ErrShardNotReady"
-	ErrOldConfig     = "ErrOldConfig"
-	ErrDuplicateOp   = "ErrDuplicateOp"
-	ErrTxnAborted    = "ErrTxnAborted"
 )
 
 type Tversion uint64
@@ -39,12 +33,6 @@ type PutArgs struct {
 	// ClientId (uuid.Nil) opts out of duplicate detection.
 	ClientId uuid.UUID
 	Seq      int64
-}
-
-// Seen records the last Put a server executed for one clerk.
-type Seen struct {
-	Seq int64
-	Err Err
 }
 
 type PutReply struct {

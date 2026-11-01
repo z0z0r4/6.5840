@@ -10,6 +10,7 @@ import (
 	kvtest "6.5840/kvtest1"
 	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardgrp"
+	"6.5840/shardkv1/shardgrp/shardrpc"
 	tester "6.5840/tester1"
 )
 
@@ -57,9 +58,9 @@ func (sck *ShardCtrler) applyConfig(cur *shardcfg.ShardConfig, new *shardcfg.Sha
 			// Freeze shard on current owner
 			err := curOwner.FreezeShard(shard, new.Num)
 			switch err {
-			case rpc.ErrOldConfig, rpc.ErrWrongGroup:
+			case shardrpc.ErrOldConfig, rpc.ErrWrongGroup:
 				return false
-			case rpc.ErrDuplicateOp:
+			case shardrpc.ErrDuplicateOp:
 				// continue
 			case rpc.OK:
 				// continue
@@ -88,9 +89,9 @@ func (sck *ShardCtrler) applyConfig(cur *shardcfg.ShardConfig, new *shardcfg.Sha
 				// Install shard on new owner
 				err = newOwner.InstallShard(shard, state, new.Num)
 				switch err {
-				case rpc.ErrOldConfig, rpc.ErrWrongGroup:
+				case shardrpc.ErrOldConfig, rpc.ErrWrongGroup:
 					return false
-				case rpc.ErrDuplicateOp:
+				case shardrpc.ErrDuplicateOp:
 					// continue
 				case rpc.OK:
 					// continue
@@ -104,9 +105,9 @@ func (sck *ShardCtrler) applyConfig(cur *shardcfg.ShardConfig, new *shardcfg.Sha
 			if owned {
 				err = curOwner.DeleteShard(shard, new.Num)
 				switch err {
-				case rpc.ErrOldConfig, rpc.ErrWrongGroup:
+				case shardrpc.ErrOldConfig, rpc.ErrWrongGroup:
 					return false
-				case rpc.ErrDuplicateOp:
+				case shardrpc.ErrDuplicateOp:
 					// continue
 				case rpc.OK:
 					// continue

@@ -42,7 +42,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 				// println("Get failed, errWrongLeader, try next server", ck.leader)
 			case rpc.ErrWrongGroup:
 				return "", 0, reply.Err
-			case rpc.ErrShardNotReady:
+			case shardrpc.ErrShardNotReady:
 				// wait for the shard to be ready
 				time.Sleep(100 * time.Millisecond)
 				continue
@@ -95,7 +95,7 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 				// println("Put failed, errWrongLeader, try next server", ck.leader)
 			case rpc.ErrWrongGroup:
 				return rpc.ErrWrongGroup
-			case rpc.ErrShardNotReady:
+			case shardrpc.ErrShardNotReady:
 				// wait for the shard to be ready
 				time.Sleep(100 * time.Millisecond)
 				continue
@@ -158,10 +158,10 @@ func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 			switch reply.Err {
 			case rpc.OK:
 				return rpc.OK
-			case rpc.ErrOldConfig, rpc.ErrWrongGroup:
+			case shardrpc.ErrOldConfig, rpc.ErrWrongGroup:
 				return reply.Err
 			case rpc.ErrWrongLeader:
-			case rpc.ErrDuplicateOp:
+			case shardrpc.ErrDuplicateOp:
 				return reply.Err
 			default:
 				println("FreezeShard failed, try next server", ck.leader, reply.Err)
@@ -182,11 +182,11 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 		ok := ck.Call(ck.servers[ck.leader], "KVServer.InstallShard", &args, &reply)
 		if ok {
 			switch reply.Err {
-			case rpc.OK, rpc.ErrOldConfig, rpc.ErrWrongGroup:
+			case rpc.OK, shardrpc.ErrOldConfig, rpc.ErrWrongGroup:
 				return reply.Err
 			case rpc.ErrWrongLeader:
-			case rpc.ErrDuplicateOp:
-				return rpc.ErrDuplicateOp
+			case shardrpc.ErrDuplicateOp:
+				return shardrpc.ErrDuplicateOp
 			default:
 				println("InstallShard failed, try next server", ck.leader, reply.Err)
 			}
@@ -206,7 +206,7 @@ func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 		ok := ck.Call(ck.servers[ck.leader], "KVServer.DeleteShard", &args, &reply)
 		if ok {
 			switch reply.Err {
-			case rpc.OK, rpc.ErrOldConfig:
+			case rpc.OK, shardrpc.ErrOldConfig:
 				return reply.Err
 			case rpc.ErrWrongGroup:
 				if reply.Num == num {
@@ -215,8 +215,8 @@ func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 				}
 				return reply.Err
 			case rpc.ErrWrongLeader:
-			case rpc.ErrDuplicateOp:
-				return rpc.ErrDuplicateOp
+			case shardrpc.ErrDuplicateOp:
+				return shardrpc.ErrDuplicateOp
 			default:
 				println("DeleteShard failed, try next server", ck.leader, reply.Err)
 			}

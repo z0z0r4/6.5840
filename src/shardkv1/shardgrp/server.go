@@ -101,7 +101,7 @@ func (kv *KVServer) DoGetOp(args *rpc.GetArgs) any {
 	}
 
 	if kv.shards[shard].Frozen || kv.txns[shard].blocks(args.Key, false) {
-		rep = rpc.GetReply{Err: rpc.ErrShardNotReady}
+		rep = rpc.GetReply{Err: shardrpc.ErrShardNotReady}
 		return rep
 	}
 
@@ -127,7 +127,7 @@ func (kv *KVServer) DoPutOp(args *rpc.PutArgs) any {
 	}
 
 	if kv.shards[shard].Frozen || kv.txns[shard].blocks(args.Key, true) {
-		rep = rpc.PutReply{Err: rpc.ErrShardNotReady}
+		rep = rpc.PutReply{Err: shardrpc.ErrShardNotReady}
 		return rep
 	}
 
@@ -175,10 +175,10 @@ func (kv *KVServer) DoFrozenShardOp(args *shardrpc.FreezeShardArgs) any {
 	var rep any
 
 	if kv.configNum > args.Num {
-		rep = shardrpc.FreezeShardReply{Err: rpc.ErrOldConfig, Num: kv.configNum}
+		rep = shardrpc.FreezeShardReply{Err: shardrpc.ErrOldConfig, Num: kv.configNum}
 		return rep
 	} else if kv.configNum == args.Num && kv.shards[args.Shard].FrozenAt == args.Num {
-		return shardrpc.FreezeShardReply{Err: rpc.ErrDuplicateOp, Num: kv.configNum}
+		return shardrpc.FreezeShardReply{Err: shardrpc.ErrDuplicateOp, Num: kv.configNum}
 	}
 	kv.configNum = args.Num
 
@@ -200,10 +200,10 @@ func (kv *KVServer) DoInstallShardOp(args *shardrpc.InstallShardArgs) any {
 	var rep any
 
 	if kv.configNum > args.Num {
-		rep = shardrpc.InstallShardReply{Err: rpc.ErrOldConfig, Num: kv.configNum}
+		rep = shardrpc.InstallShardReply{Err: shardrpc.ErrOldConfig, Num: kv.configNum}
 		return rep
 	} else if kv.configNum == args.Num && kv.shards[args.Shard].InstalledAt == args.Num {
-		return shardrpc.InstallShardReply{Err: rpc.ErrDuplicateOp, Num: kv.configNum}
+		return shardrpc.InstallShardReply{Err: shardrpc.ErrDuplicateOp, Num: kv.configNum}
 	}
 	kv.configNum = args.Num
 
@@ -225,10 +225,10 @@ func (kv *KVServer) DoDeleteShardOp(args *shardrpc.DeleteShardArgs) any {
 	var rep any
 
 	if kv.configNum > args.Num {
-		rep = shardrpc.DeleteShardReply{Err: rpc.ErrOldConfig, Num: kv.configNum}
+		rep = shardrpc.DeleteShardReply{Err: shardrpc.ErrOldConfig, Num: kv.configNum}
 		return rep
 	} else if kv.configNum == args.Num && kv.shards[args.Shard].DeletedAt == args.Num {
-		return shardrpc.DeleteShardReply{Err: rpc.ErrDuplicateOp, Num: kv.configNum}
+		return shardrpc.DeleteShardReply{Err: shardrpc.ErrDuplicateOp, Num: kv.configNum}
 	}
 	kv.configNum = args.Num
 

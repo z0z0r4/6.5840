@@ -62,7 +62,7 @@ func (ck *Clerk) Begin() *Txn {
 // transaction wrote earlier reads its buffered value (with version 0).
 func (tx *Txn) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	if tx.aborted {
-		return "", 0, rpc.ErrTxnAborted
+		return "", 0, shardrpc.ErrTxnAborted
 	}
 	if v, ok := tx.writes[key]; ok {
 		return v, 0, rpc.OK
@@ -75,9 +75,9 @@ func (tx *Txn) Get(key string) (string, rpc.Tversion, rpc.Err) {
 		reply = g.TxnGet(shardrpc.TxnGetArgs{Txn: tx.id, Key: key})
 		return reply.Err
 	})
-	if reply.Err == rpc.ErrTxnAborted {
+	if reply.Err == shardrpc.ErrTxnAborted {
 		tx.aborted = true
-		return "", 0, rpc.ErrTxnAborted
+		return "", 0, shardrpc.ErrTxnAborted
 	}
 	tx.reads[key] = true
 	return reply.Value, reply.Version, reply.Err
@@ -98,7 +98,7 @@ func (tx *Txn) Commit() rpc.Err {
 	tx.done = true
 	if tx.aborted {
 		tx.finish(false)
-		return rpc.ErrTxnAborted
+		return shardrpc.ErrTxnAborted
 	}
 
 	reads := make(map[shardcfg.Tshid][]string)
@@ -123,7 +123,7 @@ func (tx *Txn) Commit() rpc.Err {
 		if err != rpc.OK {
 			tx.aborted = true
 			tx.finish(false)
-			return rpc.ErrTxnAborted
+			return shardrpc.ErrTxnAborted
 		}
 	}
 	tx.finish(true)
@@ -172,7 +172,7 @@ func (ck *Clerk) RunTxn(fn func(tx *Txn) rpc.Err) rpc.Err {
 		} else {
 			tx.Abort()
 		}
-		if err != rpc.ErrTxnAborted {
+		if err != shardrpc.ErrTxnAborted {
 			return err
 		}
 		time.Sleep(time.Duration(rand.Int63n(int64(backoff))))
@@ -192,7 +192,7 @@ func (ck *Clerk) toShard(shard shardcfg.Tshid, call func(*shardgrp.Clerk) rpc.Er
 			g = ck.makeGrpClerk(gid, ck.config.Groups[gid])
 		}
 		switch err := call(g); err {
-		case rpc.ErrWrongGroup, rpc.ErrShardNotReady:
+		case rpc.ErrWrongGroup, shardrpc.ErrShardNotReady:
 			time.Sleep(100 * time.Millisecond)
 			ck.config = ck.sck.Query()
 		default:

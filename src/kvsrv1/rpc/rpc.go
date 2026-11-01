@@ -23,6 +23,7 @@ const (
 	ErrShardNotReady = "ErrShardNotReady"
 	ErrOldConfig     = "ErrOldConfig"
 	ErrDuplicateOp   = "ErrDuplicateOp"
+	ErrTxnAborted    = "ErrTxnAborted"
 )
 
 type Tversion uint64

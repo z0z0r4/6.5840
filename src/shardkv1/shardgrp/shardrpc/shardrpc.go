@@ -7,6 +7,15 @@ import (
 	"6.5840/shardkv1/shardcfg"
 )
 
+// Errors specific to shardkv, beyond the ones in kvsrv1/rpc shared by
+// all the key/value services.
+const (
+	ErrShardNotReady rpc.Err = "ErrShardNotReady" // shard is frozen for a move, or locked by a transaction
+	ErrOldConfig     rpc.Err = "ErrOldConfig"     // request is for an older configuration
+	ErrDuplicateOp   rpc.Err = "ErrDuplicateOp"   // reconfiguration step already done
+	ErrTxnAborted    rpc.Err = "ErrTxnAborted"    // transaction aborted
+)
+
 type FreezeShardArgs struct {
 	Shard shardcfg.Tshid
 	Num   shardcfg.Tnum

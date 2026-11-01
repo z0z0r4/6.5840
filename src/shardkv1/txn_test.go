@@ -10,6 +10,7 @@ import (
 	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
 	"6.5840/shardkv1/shardcfg"
+	"6.5840/shardkv1/shardgrp/shardrpc"
 	"6.5840/tester1"
 )
 
@@ -95,7 +96,7 @@ func TestTxnBasicExt(t *testing.T) {
 	}
 	tx2 := txnClerk(ts.MakeClerk()).Begin()
 	tx2.Put(k, "tx2")
-	if err := tx2.Commit(); err != rpc.ErrTxnAborted {
+	if err := tx2.Commit(); err != shardrpc.ErrTxnAborted {
 		ts.Fatalf("tx2 wrote a key read-locked by tx1: %v", err)
 	}
 

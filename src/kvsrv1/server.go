@@ -27,13 +27,19 @@ type KVServer struct {
 
 	// The last Put executed for each clerk, to answer resent Puts
 	// without executing them a second time.
-	lastPut map[uuid.UUID]rpc.Seen
+	lastPut map[uuid.UUID]seenPut
+}
+
+// The last Put a server executed for one clerk, and its result.
+type seenPut struct {
+	Seq int64
+	Err rpc.Err
 }
 
 func MakeKVServer() *KVServer {
 	kv := &KVServer{}
 	kv.kvStore = new(btree.Map[string, ValueVersion])
-	kv.lastPut = make(map[uuid.UUID]rpc.Seen)
+	kv.lastPut = make(map[uuid.UUID]seenPut)
 	return kv
 }
 
@@ -70,7 +76,7 @@ func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 			return
 		}
 		defer func() {
-			kv.lastPut[args.ClientId] = rpc.Seen{Seq: args.Seq, Err: reply.Err}
+			kv.lastPut[args.ClientId] = seenPut{Seq: args.Seq, Err: reply.Err}
 		}()
 	}
 

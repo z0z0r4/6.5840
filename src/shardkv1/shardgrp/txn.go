@@ -104,7 +104,7 @@ func (kv *KVServer) servingLocked(shard shardcfg.Tshid) (*ShardTxns, rpc.Err) {
 		return nil, rpc.ErrWrongGroup
 	}
 	if kv.shards[shard].Frozen {
-		return nil, rpc.ErrShardNotReady
+		return nil, shardrpc.ErrShardNotReady
 	}
 	return kv.txns[shard], rpc.OK
 }
@@ -120,11 +120,11 @@ func (kv *KVServer) DoTxnGetOp(args *shardrpc.TxnGetArgs) any {
 		return shardrpc.TxnGetReply{Err: err}
 	}
 	if st.Finished[args.Txn] {
-		return shardrpc.TxnGetReply{Err: rpc.ErrTxnAborted}
+		return shardrpc.TxnGetReply{Err: shardrpc.ErrTxnAborted}
 	}
 	if !st.canRead(args.Txn, args.Key) {
 		st.finish(args.Txn)
-		return shardrpc.TxnGetReply{Err: rpc.ErrTxnAborted}
+		return shardrpc.TxnGetReply{Err: shardrpc.ErrTxnAborted}
 	}
 	st.lock(args.Key).Readers[args.Txn] = true
 
@@ -149,7 +149,7 @@ func (kv *KVServer) DoTxnPrepareOp(args *shardrpc.TxnPrepareArgs) any {
 		return shardrpc.TxnPrepareReply{Err: rpc.OK} // duplicate
 	}
 	if st.Finished[args.Txn] {
-		return shardrpc.TxnPrepareReply{Err: rpc.ErrTxnAborted}
+		return shardrpc.TxnPrepareReply{Err: shardrpc.ErrTxnAborted}
 	}
 
 	ok := true
@@ -165,7 +165,7 @@ func (kv *KVServer) DoTxnPrepareOp(args *shardrpc.TxnPrepareArgs) any {
 	}
 	if !ok {
 		st.finish(args.Txn)
-		return shardrpc.TxnPrepareReply{Err: rpc.ErrTxnAborted}
+		return shardrpc.TxnPrepareReply{Err: shardrpc.ErrTxnAborted}
 	}
 
 	for key := range args.Writes {

@@ -11,6 +11,7 @@ import (
 	//	"bytes"
 	"bytes"
 	"math/rand"
+	"sort"
 	"sync"
 	"time"
 
@@ -66,6 +67,11 @@ type Raft struct {
 
 	// A snapshot installed from the leader that applier still has to deliver.
 	pendingSnapshot bool
+
+	// Leader leases (see SetLease). leaseDuration is 0 when disabled.
+	leaseDuration time.Duration
+	leaderSince   time.Time   // when this peer became leader of currentTerm
+	ackSent       []time.Time // per peer: send time of the latest AppendEntries/InstallSnapshot it acknowledged in currentTerm
 }
 
 // Logical index -> physical index in rf.log
@@ -200,6 +206,10 @@ func (rf *Raft) PersistBytes() int {
 
 func (rf *Raft) BecomeLeaderLocked() {
 	rf.state = Leader
+	rf.leaderSince = time.Now()
+	for i := range rf.ackSent {
+		rf.ackSent[i] = time.Time{}
+	}
 	// println("Server", rf.me, "became leader for term", rf.currentTerm)
 
 	// Initialize nextIndex and matchIndex for each follower
@@ -637,6 +647,7 @@ func (rf *Raft) sendAppendEntriesToServer(server int) {
 	args.LeaderCommit = rf.commitIndex
 	rf.mu.Unlock()
 
+	sent := time.Now()
 	var reply AppendEntriesReply
 
 	// println("Server", rf.me, "sending AppendEntries RPC to server", server, "with PrevLogIndex", args.PrevLogIndex, "PrevLogTerm", args.PrevLogTerm, "entries length", len(args.Entries), "LeaderCommit", args.LeaderCommit)
@@ -658,6 +669,10 @@ func (rf *Raft) sendAppendEntriesToServer(server int) {
 		return
 	}
 
+	// A reply in our term (success or not) means the peer accepted us as
+	// leader at some point after sent.
+	rf.ackLeaseLocked(server, sent)
+
 	if reply.Success {
 		if rf.matchIndex[server] < args.PrevLogIndex+len(args.Entries) {
 			rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
@@ -665,7 +680,7 @@ func (rf *Raft) sendAppendEntriesToServer(server int) {
 		}
 
 		// Check if the log entry has been committed by a majority of servers
-		for n := rf.logEndLocked() - 1; n > rf.commitIndex; n-- {
+		for n := rf.logEndLocked() - 1; n > rf.commitIndex && rf.mayCommitLocked(); n-- {
 			// !Consider §5.4.2 Figure 8, old term entries should not be committed by new term leaders,
 			// They can only be committed when the leader commits an entry behind them in the current
 			if rf.getLogLocked(n).Term != rf.currentTerm {
@@ -736,6 +751,7 @@ func (rf *Raft) sendInstallSnapshotToServer(server int) {
 	}
 	rf.mu.Unlock()
 
+	sent := time.Now()
 	reply := &InstallSnapshotReply{}
 
 	ok := rf.sendInstallSnapshot(server, args, reply)
@@ -755,6 +771,8 @@ func (rf *Raft) sendInstallSnapshotToServer(server int) {
 	if rf.state != Leader || rf.currentTerm != args.Term {
 		return
 	}
+
+	rf.ackLeaseLocked(server, sent)
 
 	rf.nextIndex[server] = max(rf.nextIndex[server], args.LastIncludedIndex+1)
 	rf.matchIndex[server] = max(rf.matchIndex[server], args.LastIncludedIndex)
@@ -973,6 +991,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *tester.Persister, applyC
 		rf.matchIndex[i] = 0
 	}
 
+	rf.ackSent = make([]time.Time, len(peers))
+
 	// initialize from state persisted before a crash
 	rf.restore()
 
@@ -981,6 +1001,77 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *tester.Persister, applyC
 	go rf.applier()
 
 	return rf
+}
+
+// Leader leases (Raft paper, end of section 8).
+//
+// A leader may answer read-only requests from its own state, without
+// a round through the log, while it holds a lease: if a majority of
+// peers acknowledged an AppendEntries that the leader sent at time t,
+// the lease lasts until t + leaseDuration.
+//
+// Safety: for another peer to be elected, a majority must vote for it.
+// That majority overlaps the majority behind the lease, and a peer
+// acknowledges the old leader before voting in a higher term. So the
+// new leader is elected after time t. A new leader doesn't commit
+// anything until leaseDuration has passed since its election, so no
+// write commits under the new term while an old leader can still serve
+// reads under its lease. This assumes the peers' clocks advance at the
+// same rate (they all run on one machine in the tests).
+
+// SetLease enables leases of duration d (0 disables them).
+func (rf *Raft) SetLease(d time.Duration) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.leaseDuration = d
+}
+
+func (rf *Raft) ackLeaseLocked(server int, sent time.Time) {
+	if sent.After(rf.ackSent[server]) {
+		rf.ackSent[server] = sent
+	}
+}
+
+// A new leader must wait out any lease a previous leader may still hold
+// before it commits.
+func (rf *Raft) mayCommitLocked() bool {
+	return rf.leaseDuration == 0 || time.Since(rf.leaderSince) >= rf.leaseDuration
+}
+
+// The time until which a majority has acknowledged this leader.
+func (rf *Raft) leaseExpiryLocked() time.Time {
+	acks := make([]time.Time, 0, len(rf.peers))
+	for i := range rf.peers {
+		if i == rf.me {
+			acks = append(acks, time.Now())
+		} else {
+			acks = append(acks, rf.ackSent[i])
+		}
+	}
+	// the majority-th most recent acknowledgement
+	sort.Slice(acks, func(i, j int) bool { return acks[i].After(acks[j]) })
+	return acks[len(acks)/2].Add(rf.leaseDuration)
+}
+
+// LeaseRead returns the commit index a read may be served at, and true,
+// if this peer is a leader holding a valid lease. The caller must wait
+// until the state machine has applied that index and then read its
+// state. The leader must have committed an entry in its own term, so
+// that commitIndex covers every entry committed by earlier leaders.
+func (rf *Raft) LeaseRead() (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.leaseDuration == 0 || rf.state != Leader {
+		return 0, false
+	}
+	if rf.getLogLocked(rf.commitIndex).Term != rf.currentTerm {
+		return 0, false
+	}
+	if !time.Now().Before(rf.leaseExpiryLocked()) {
+		return 0, false
+	}
+	return rf.commitIndex, true
 }
 
 type LogEntry struct {

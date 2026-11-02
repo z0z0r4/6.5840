@@ -23,6 +23,11 @@ type ShardCtrler struct {
 
 	grpClerks map[tester.Tgid]*shardgrp.Clerk // one clerk per group, so each remembers its leader
 
+	// Set once another controller has changed the configuration under
+	// this one. A deposed controller has lost leadership for good and
+	// makes no further configuration changes.
+	deposed bool
+
 	// Your data here.
 }
 
@@ -44,6 +49,29 @@ func (sck *ShardCtrler) grpClerk(gid tester.Tgid, servers []string) *shardgrp.Cl
 	return ck
 }
 
+// superseded reports whether the stored configuration has already
+// reached num, i.e. another controller finished this step.
+func (sck *ShardCtrler) superseded(num shardcfg.Tnum) bool {
+	cfg, _, err := sck.get_config("config")
+	return err == rpc.OK && cfg.Num >= num
+}
+
+// untilAnswered runs a shard RPC until some server of the group answers,
+// and returns its error. If no server answers, the group may have left
+// and been shut down, which only happens after a newer controller has
+// finished this step; ok is false in that case and the caller must give
+// up. Otherwise the group is only unreachable for now, so try again.
+func (sck *ShardCtrler) untilAnswered(num shardcfg.Tnum, op func() rpc.Err) (err rpc.Err, ok bool) {
+	for {
+		if err = op(); err != shardrpc.ErrUnreachable {
+			return err, true
+		}
+		if sck.superseded(num) {
+			return err, false
+		}
+	}
+}
+
 func (sck *ShardCtrler) applyConfig(cur *shardcfg.ShardConfig, new *shardcfg.ShardConfig) bool {
 	// Diff the current and new configurations to determine which shards have changed ownership
 	for shard := range shardcfg.Tshid(shardcfg.NShards) {
@@ -56,7 +84,12 @@ func (sck *ShardCtrler) applyConfig(cur *shardcfg.ShardConfig, new *shardcfg.Sha
 			newOwner := sck.grpClerk(newGid, new.Groups[newGid])
 
 			// Freeze shard on current owner
-			err := curOwner.FreezeShard(shard, new.Num)
+			err, ok := sck.untilAnswered(new.Num, func() rpc.Err {
+				return curOwner.FreezeShard(shard, new.Num)
+			})
+			if !ok {
+				return false
+			}
 			switch err {
 			case shardrpc.ErrOldConfig, rpc.ErrWrongGroup:
 				return false
@@ -71,11 +104,26 @@ func (sck *ShardCtrler) applyConfig(cur *shardcfg.ShardConfig, new *shardcfg.Sha
 
 			// Get the state of the shard from the current owner
 			need_install := true
-			state, owned, _, err := curOwner.GetShard(shard)
+			var state []byte
+			var owned bool
+			err, ok = sck.untilAnswered(new.Num, func() (e rpc.Err) {
+				state, owned, _, e = curOwner.GetShard(shard)
+				return e
+			})
+			if !ok {
+				return false
+			}
 			switch err {
 			case rpc.ErrWrongGroup:
 				// check newOwner
-				_, new_owned, _, new_err := newOwner.GetShard(shard)
+				var new_owned bool
+				new_err, ok := sck.untilAnswered(new.Num, func() (e rpc.Err) {
+					_, new_owned, _, e = newOwner.GetShard(shard)
+					return e
+				})
+				if !ok {
+					return false
+				}
 				if new_err == rpc.OK && new_owned {
 					need_install = false
 				}
@@ -87,7 +135,12 @@ func (sck *ShardCtrler) applyConfig(cur *shardcfg.ShardConfig, new *shardcfg.Sha
 
 			if need_install {
 				// Install shard on new owner
-				err = newOwner.InstallShard(shard, state, new.Num)
+				err, ok = sck.untilAnswered(new.Num, func() rpc.Err {
+					return newOwner.InstallShard(shard, state, new.Num)
+				})
+				if !ok {
+					return false
+				}
 				switch err {
 				case shardrpc.ErrOldConfig, rpc.ErrWrongGroup:
 					return false
@@ -103,7 +156,12 @@ func (sck *ShardCtrler) applyConfig(cur *shardcfg.ShardConfig, new *shardcfg.Sha
 
 			// Delete shard from current owner
 			if owned {
-				err = curOwner.DeleteShard(shard, new.Num)
+				err, ok = sck.untilAnswered(new.Num, func() rpc.Err {
+					return curOwner.DeleteShard(shard, new.Num)
+				})
+				if !ok {
+					return false
+				}
 				switch err {
 				case shardrpc.ErrOldConfig, rpc.ErrWrongGroup:
 					return false
@@ -162,11 +220,15 @@ func (sck *ShardCtrler) InitController() {
 	if err == rpc.OK {
 		// continue apply it
 		if next_config.Num > cur.Num {
-			sck.applyConfig(cur, next_config)
+			if !sck.applyConfig(cur, next_config) {
+				sck.deposed = true
+				return
+			}
 			put_success := sck.put_config("config", next_config, v)
 			if put_success {
 				println("InitController: applied next_config", next_config.Num, "to config")
 			} else {
+				sck.deposed = true
 				println("InitController: failed to put config from", cur.Num, "to", next_config.Num)
 			}
 		}
@@ -188,8 +250,21 @@ func (sck *ShardCtrler) InitConfig(cfg *shardcfg.ShardConfig) {
 // Called by the tester to ask the controller to change the
 // configuration from the current one to new.  While the controller
 // changes the configuration it may be superseded by another
-// controller.
+// controller. A superseded controller stops: it returns without a
+// change now and on every later call.
 func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
+	if sck.deposed {
+		return
+	}
+	// Each early return below means another controller changed the
+	// configuration while this one was working on it.
+	changed := false
+	defer func() {
+		if !changed {
+			sck.deposed = true
+		}
+	}()
+
 	// get current config from kvraft
 	cur, v, err := sck.get_config("config")
 	if err != rpc.OK {
@@ -220,6 +295,7 @@ func (sck *ShardCtrler) ChangeConfigTo(new *shardcfg.ShardConfig) {
 
 	put_success := sck.put_config("config", next_config, v)
 	if put_success {
+		changed = true
 		println("ChangeConfigTo: Success from", cur.Num, "to", new.Num)
 	} else {
 		println("ChangeConfigTo: Failed to put config from", cur.Num, "to", new.Num)

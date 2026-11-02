@@ -124,20 +124,33 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	}
 }
 
-// Retry until the group's leader returns OK
+// Retry until the group's leader returns OK or ErrWrongGroup, or until
+// no server answers (ErrUnreachable).
 func (ck *Clerk) GetShard(s shardcfg.Tshid) (state []byte, owned bool, frozen bool, err rpc.Err) {
+	fails := 0
 	for {
 		args := shardrpc.GetShardArgs{Shard: s}
 		reply := shardrpc.GetShardReply{}
 
 		ok := ck.Call(ck.servers[ck.leader], "KVServer.GetShard", &args, &reply)
 		if ok {
+			fails = 0
 			switch reply.Err {
 			case rpc.OK, rpc.ErrWrongGroup:
 				return reply.State, reply.Owned, reply.Frozen, reply.Err
 			case rpc.ErrWrongLeader:
 			default:
 				println("GetShard failed, try next server", ck.leader, reply.Err)
+			}
+		}
+
+		// No server in the group answered. The group may have left and
+		// been shut down after a newer controller finished this step;
+		// let the controller check.
+		if !ok {
+			fails++
+			if fails >= len(ck.servers) {
+				return nil, false, false, shardrpc.ErrUnreachable
 			}
 		}
 
@@ -148,13 +161,16 @@ func (ck *Clerk) GetShard(s shardcfg.Tshid) (state []byte, owned bool, frozen bo
 	}
 }
 
-// Retry until the group's leader returns OK, ErrOldConfig or ErrWrongGroup.
+// Retry until the group's leader returns OK, ErrOldConfig or ErrWrongGroup,
+// or until no server answers (ErrUnreachable).
 func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
+	fails := 0
 	for {
 		args := shardrpc.FreezeShardArgs{Shard: s, Num: num}
 		reply := shardrpc.FreezeShardReply{}
 		ok := ck.Call(ck.servers[ck.leader], "KVServer.FreezeShard", &args, &reply)
 		if ok {
+			fails = 0
 			switch reply.Err {
 			case rpc.OK:
 				return rpc.OK
@@ -168,6 +184,16 @@ func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 			}
 		}
 
+		// No server in the group answered. The group may have left and
+		// been shut down after a newer controller finished this step;
+		// let the controller check.
+		if !ok {
+			fails++
+			if fails >= len(ck.servers) {
+				return shardrpc.ErrUnreachable
+			}
+		}
+
 		// ErrWrongLeader or RPC failure, try the next server
 		ck.leader = (ck.leader + 1) % len(ck.servers)
 
@@ -176,11 +202,13 @@ func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 }
 
 func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum) rpc.Err {
+	fails := 0
 	for {
 		args := shardrpc.InstallShardArgs{Shard: s, State: state, Num: num}
 		reply := shardrpc.InstallShardReply{}
 		ok := ck.Call(ck.servers[ck.leader], "KVServer.InstallShard", &args, &reply)
 		if ok {
+			fails = 0
 			switch reply.Err {
 			case rpc.OK, shardrpc.ErrOldConfig, rpc.ErrWrongGroup:
 				return reply.Err
@@ -192,6 +220,16 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 			}
 		}
 
+		// No server in the group answered. The group may have left and
+		// been shut down after a newer controller finished this step;
+		// let the controller check.
+		if !ok {
+			fails++
+			if fails >= len(ck.servers) {
+				return shardrpc.ErrUnreachable
+			}
+		}
+
 		// ErrWrongLeader or RPC failure, try the next server
 		ck.leader = (ck.leader + 1) % len(ck.servers)
 
@@ -200,11 +238,13 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 }
 
 func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
+	fails := 0
 	for {
 		args := shardrpc.DeleteShardArgs{Shard: s, Num: num}
 		reply := shardrpc.DeleteShardReply{}
 		ok := ck.Call(ck.servers[ck.leader], "KVServer.DeleteShard", &args, &reply)
 		if ok {
+			fails = 0
 			switch reply.Err {
 			case rpc.OK, shardrpc.ErrOldConfig:
 				return reply.Err
@@ -219,6 +259,16 @@ func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 				return shardrpc.ErrDuplicateOp
 			default:
 				println("DeleteShard failed, try next server", ck.leader, reply.Err)
+			}
+		}
+
+		// No server in the group answered. The group may have left and
+		// been shut down after a newer controller finished this step;
+		// let the controller check.
+		if !ok {
+			fails++
+			if fails >= len(ck.servers) {
+				return shardrpc.ErrUnreachable
 			}
 		}
 

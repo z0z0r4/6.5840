@@ -14,6 +14,7 @@ const (
 	ErrOldConfig     rpc.Err = "ErrOldConfig"     // request is for an older configuration
 	ErrDuplicateOp   rpc.Err = "ErrDuplicateOp"   // reconfiguration step already done
 	ErrTxnAborted    rpc.Err = "ErrTxnAborted"    // transaction aborted
+	ErrUnreachable   rpc.Err = "ErrUnreachable"   // no server of the group answered
 )
 
 type FreezeShardArgs struct {

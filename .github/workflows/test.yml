@@ -1,0 +1,69 @@
+name: test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch or PR supersedes the running tests.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.lab }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Every lab runs to completion, so one flaky suite doesn't hide the others.
+      fail-fast: false
+      matrix:
+        lab: [mr, kvsrv1, lock1, raft1, rsm1, kvraft1, shardkv]
+    # The slowest suite (shardkv) takes about 11 minutes locally with -race.
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache-dependency-path: src/go.sum
+
+      # The Makefile builds the server daemons (main/*d) with -race and then
+      # runs the suite with -race, same as a local `make <lab>`.
+      - name: make ${{ matrix.lab }}
+        run: |
+          set -o pipefail
+          make ${{ matrix.lab }} 2>&1 | tee test.log
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.lab }}"
+            echo
+            echo "passed: $(grep -c '^--- PASS' test.log || true)"
+            if grep -q '^--- FAIL' test.log; then
+              echo
+              echo "failed:"
+              grep '^--- FAIL' test.log | sed 's/^/- /'
+            fi
+            if grep -q 'WARNING: DATA RACE' test.log; then
+              echo
+              echo "data races: $(grep -c 'WARNING: DATA RACE' test.log)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.lab }}-log
+          path: src/test.log

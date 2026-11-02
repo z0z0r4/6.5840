@@ -220,6 +220,14 @@ func (rf *Raft) BecomeLeaderLocked() {
 		rf.nextIndex[i] = rf.logEndLocked()
 		rf.matchIndex[i] = 0
 	}
+
+	// Announce the election right away (Figure 2: "Upon election: send
+	// initial empty AppendEntries RPCs (heartbeat) to each server").
+	// Waiting for the next heartbeat tick lets a rival candidate of the
+	// same election time out again and depose this leader, losing any
+	// entry it has accepted but not yet committed.
+	rf.boardcastHeartbeatLocked()
+	rf.lastHeartbeat = time.Now()
 }
 
 func (rf *Raft) resetElectionTimeoutLocked() {
